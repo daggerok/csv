@@ -59,16 +59,21 @@
  * to sort imported datasets by file name natively. This ensures `file2.csv`
  * appears before `file10.csv`.
  *
- * 6. [Async File Processing Pipeline with Progressive Loading UI]
- * - Files are processed sequentially using async/await with `processFileAsync`
- *   which wraps FileReader in a Promise for clean async control flow.
- * - `extractValidTableData` is yielded via `yieldToMain` (a `setTimeout(0)`
- *   Promise) between each file so the browser event loop can breathe and
- *   repaint the spinner between heavy CPU-bound parse operations.
- * - `loadingState` tracks: `{ active: boolean, current: number, total: number, fileName: string }`
- *   and drives the full-viewport overlay spinner with per-file progress display.
- * - The spinner overlay uses a CSS conic-gradient animated ring with a pulsing
- *   file counter badge, fully self-contained without external icon libraries.
+ * 6. [Two-Phase Async Pipeline with Paint-Aware Spinner Lifecycle]
+ * - PHASE 1 — PARSE: Files are read and parsed sequentially via `processFileAsync`.
+ *   Each file yields to the main thread between I/O and CPU-bound parsing so the
+ *   spinner can repaint with per-file progress. Parsed results are accumulated in
+ *   a local staging array, NOT committed to React state yet.
+ * - PHASE 2 — RENDER: After all files are parsed, `loadingState.phase` transitions
+ *   to `'rendering'` and the staged data is committed to `dataSets` in a single
+ *   `setDataSets()` call. The spinner remains visible showing "Rendering…".
+ * - PAINT DETECTION: A `useEffect` watches for the `rendering` phase and uses
+ *   double-`requestAnimationFrame` gating (`waitForPaint`) — the first rAF fires
+ *   after React commits to the DOM, the second fires after the browser has
+ *   actually composited and painted those DOM changes to screen. Only then is
+ *   `loadingState` reset to dismiss the overlay.
+ * - This eliminates the "spinner vanishes but UI is still frozen" gap that occurs
+ *   when React needs 500ms–2s to reconcile thousands of table rows.
  *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
@@ -77,7 +82,7 @@
  */
 
 // @ts-ignore
-import React, { useState, useEffect, useRef, useMemo, ChangeEvent } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, ChangeEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 
 // --- TYPES ---
@@ -96,14 +101,21 @@ interface DataSet {
 }
 
 /**
- * Tracks the async file loading pipeline state.
+ * Two-phase loading state tracker.
+ *
+ * Phase lifecycle:
+ *   idle → 'parsing' (files being read + parsed) → 'rendering' (data committed to
+ *   React state, DOM reconciliation in progress) → idle (paint confirmed)
+ *
  * - `active`: Whether the loading overlay should be visible.
- * - `current`: How many files have been fully processed so far.
+ * - `phase`: Current pipeline phase — drives spinner messaging.
+ * - `current`: How many files have been fully processed so far (parse phase).
  * - `total`: Total files in the current import batch.
  * - `fileName`: The name of the file currently being parsed (for display).
  */
 interface LoadingState {
     active: boolean;
+    phase: 'idle' | 'parsing' | 'rendering';
     current: number;
     total: number;
     fileName: string;
@@ -120,6 +132,7 @@ const DEFAULT_SETTINGS: AppSettings = {
 
 const DEFAULT_LOADING_STATE: LoadingState = {
     active: false,
+    phase: 'idle',
     current: 0,
     total: 0,
     fileName: '',
@@ -225,6 +238,31 @@ function readFileAsText(file: File): Promise<string> {
     });
 }
 
+/**
+ * Double-requestAnimationFrame paint gate.
+ *
+ * Why double rAF?
+ * - The first `requestAnimationFrame` callback fires AFTER React has flushed
+ *   its DOM mutations but potentially BEFORE the browser has composited/painted.
+ * - The second `requestAnimationFrame` (nested inside the first) fires after
+ *   the browser has actually rendered the new frame to screen.
+ * - This guarantees that any DOM-heavy reconciliation (thousands of table rows)
+ *   has been fully painted before we resolve, so dismissing the spinner won't
+ *   reveal a still-frozen or partially-rendered page.
+ *
+ * Returns a Promise<void> that resolves after the confirmed paint.
+ */
+function waitForPaint(): Promise<void> {
+    return new Promise(resolve => {
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                resolve();
+            });
+        });
+    });
+}
+
+
 // --- SPINNER OVERLAY COMPONENT ---
 
 /**
@@ -234,8 +272,9 @@ function readFileAsText(file: File): Promise<string> {
  * - Semi-transparent backdrop with blur to dim but not fully hide existing content.
  * - Animated conic-gradient spinner ring (CSS @keyframes spin via Tailwind `animate-spin`).
  * - Inner pulsing circle with a document SVG icon.
- * - Dynamic file counter badge: "Processing X of Y".
+ * - Dynamic file counter badge: "Processing X of Y" (parse phase) or "Rendering…" (render phase).
  * - Current filename truncated to prevent layout overflow.
+ * - Linear progress bar with animated width transitions.
  *
  * Props:
  * - `state`: The current `LoadingState` snapshot driven by the async pipeline.
@@ -243,10 +282,15 @@ function readFileAsText(file: File): Promise<string> {
 const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
     if (!state.active) return null;
 
-    // Progress fraction 0..1 for the arc — clamped so it never shows 0 on first file
-    const progressFraction = state.total > 0
-        ? Math.max((state.current / state.total), 0)
-        : 0;
+    const isParsing = state.phase === 'parsing';
+    const isRendering = state.phase === 'rendering';
+
+    // Progress fraction 0..1 for the arc — during rendering phase, show full
+    const progressFraction = isRendering
+        ? 1
+        : state.total > 0
+            ? Math.max((state.current / state.total), 0)
+            : 0;
     const progressPercent = Math.round(progressFraction * 100);
 
     return (
@@ -287,7 +331,6 @@ const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
                         viewBox="0 0 80 80"
                         fill="none"
                         aria-hidden="true"
-                        style={{ transition: 'stroke-dashoffset 0.4s ease' }}
                     >
                         <circle
                             cx="40" cy="40" r="34"
@@ -320,57 +363,92 @@ const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
                         />
                     </svg>
 
-                    {/* Inner icon — document with pulse */}
+                    {/* Inner icon — document with pulse (parse) or paint-brush (render) */}
                     <div className="relative z-10 flex items-center justify-center
                                     w-11 h-11 rounded-full
                                     bg-blue-50 dark:bg-blue-950/60
                                     animate-pulse"
                          style={{ animationDuration: '1.6s' }}
                     >
-                        <svg
-                            className="w-5 h-5 text-blue-600 dark:text-blue-400"
-                            fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                            aria-hidden="true"
-                        >
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586
-                                     a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19
-                                     a2 2 0 01-2 2z" />
-                        </svg>
+                        {isParsing ? (
+                            /* Document icon during parse phase */
+                            <svg
+                                className="w-5 h-5 text-blue-600 dark:text-blue-400"
+                                fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                                aria-hidden="true"
+                            >
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586
+                                         a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19
+                                         a2 2 0 01-2 2z" />
+                            </svg>
+                        ) : (
+                            /* Grid/table icon during render phase */
+                            <svg
+                                className="w-5 h-5 text-amber-600 dark:text-amber-400"
+                                fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                                aria-hidden="true"
+                            >
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                      d="M3 10h18M3 14h18M10 3v18M14 3v18" />
+                            </svg>
+                        )}
                     </div>
                 </div>
 
-                {/* Title */}
-                <div className="flex flex-col items-center gap-1 text-center">
+                {/* Title — changes by phase */}
+                <div className="flex flex-col items-center gap-1.5 text-center">
                     <p className="text-base font-bold text-slate-800 dark:text-slate-100 tracking-tight">
-                        Processing Files…
+                        {isParsing ? 'Processing Files…' : 'Rendering Table…'}
                     </p>
 
-                    {/* File counter badge */}
-                    <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full
-                                     bg-blue-100 dark:bg-blue-900/50
-                                     text-blue-700 dark:text-blue-300
-                                     text-xs font-semibold tracking-wide">
-                        {/* Mini spinner dot */}
-                        <span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse" />
-                        {state.current} of {state.total} complete
-                    </span>
+                    {/* Phase-aware status badge */}
+                    {isParsing ? (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full
+                                         bg-blue-100 dark:bg-blue-900/50
+                                         text-blue-700 dark:text-blue-300
+                                         text-xs font-semibold tracking-wide">
+                            {/* Mini spinner dot */}
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse" />
+                            {state.current} of {state.total} parsed
+                        </span>
+                    ) : (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full
+                                         bg-amber-100 dark:bg-amber-900/50
+                                         text-amber-700 dark:text-amber-300
+                                         text-xs font-semibold tracking-wide">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 dark:bg-amber-400 animate-pulse" />
+                            Building DOM layout…
+                        </span>
+                    )}
                 </div>
 
                 {/* Progress bar */}
                 <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
                     <div
-                        className="h-full bg-blue-500 dark:bg-blue-400 rounded-full transition-all duration-300 ease-out"
+                        className={`h-full rounded-full transition-all duration-300 ease-out ${
+                            isRendering
+                                ? 'bg-amber-500 dark:bg-amber-400 animate-pulse'
+                                : 'bg-blue-500 dark:bg-blue-400'
+                        }`}
                         style={{ width: `${progressPercent}%` }}
                     />
                 </div>
 
-                {/* Current filename */}
-                {state.fileName && (
+                {/* Current filename (parse phase only) */}
+                {isParsing && state.fileName && (
                     <p className="text-xs text-slate-400 dark:text-slate-500
                                   max-w-full truncate text-center font-mono tracking-tight"
                        title={state.fileName}>
                         {state.fileName}
+                    </p>
+                )}
+
+                {/* Render phase sub-hint */}
+                {isRendering && (
+                    <p className="text-[11px] text-slate-400 dark:text-slate-500 text-center leading-snug">
+                        Large tables may take a moment to paint.
+                        <br />The spinner will dismiss after the browser finishes.
                     </p>
                 )}
             </div>
@@ -400,7 +478,7 @@ const App: React.FC = () => {
     const [dataSets, setDataSets] = useState<DataSet[]>([]);
     const [activeTab, setActiveTab] = useState<number>(0);
 
-    // Async pipeline loading state — drives the overlay spinner
+    // Two-phase async pipeline loading state — drives the overlay spinner
     const [loadingState, setLoadingState] = useState<LoadingState>(DEFAULT_LOADING_STATE);
 
     // UI Local State for inline renaming
@@ -421,6 +499,45 @@ const App: React.FC = () => {
             document.documentElement.classList.remove('dark');
         }
     }, [settings]);
+
+    /**
+     * PHASE 2 PAINT DETECTION EFFECT
+     *
+     * When `loadingState.phase` transitions to `'rendering'`, React has already
+     * committed the new `dataSets` to state (triggered synchronously before this
+     * phase transition). This effect waits for the browser to fully paint the
+     * resulting DOM changes using double-rAF gating, then dismisses the spinner.
+     *
+     * Why useEffect and not inline in the async function?
+     * Because `setDataSets(...)` is asynchronous from React's perspective — the
+     * component re-renders with new data, but we need to wait for THAT render's
+     * paint, not just the current tick. `useEffect` fires after React has committed
+     * the render that includes the new table rows, making it the correct hook point
+     * to schedule paint detection from.
+     */
+    useEffect(() => {
+        if (loadingState.phase !== 'rendering') return;
+
+        let cancelled = false;
+
+        const detectPaintAndDismiss = async () => {
+            // Wait for React's committed DOM changes to be actually painted
+            await waitForPaint();
+
+            // Extra safety yield — for very large DOMs, the browser may need
+            // one more frame to finish layout/compositing
+            await waitForPaint();
+
+            if (!cancelled) {
+                setLoadingState(DEFAULT_LOADING_STATE);
+            }
+        };
+
+        detectPaintAndDismiss();
+
+        // Cleanup in case the component unmounts during the wait
+        return () => { cancelled = true; };
+    }, [loadingState.phase]);
 
     const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
         setSettings(prev => ({ ...prev, [key]: value }));
@@ -460,35 +577,35 @@ const App: React.FC = () => {
         fileInputRef.current?.click();
     };
 
-    // --- ASYNC FILE PROCESSING PIPELINE ---
+    // --- TWO-PHASE ASYNC FILE PROCESSING PIPELINE ---
     /**
-     * Processes an array of File objects sequentially through the async pipeline:
+     * PHASE 1 — PARSE:
+     *   For each file sequentially:
+     *     1. Update `loadingState.fileName` → yield → (spinner repaints with filename)
+     *     2. Read file via `readFileAsText` → yield → (browser breathes between I/O and CPU)
+     *     3. Run `extractValidTableData` (CPU-heavy, synchronous)
+     *     4. Increment `loadingState.current` → yield → (progress bar advances)
+     *   Results accumulate in a local `newResults[]` staging array.
      *
-     * For each file:
-     *   1. Update `loadingState.fileName` so the spinner shows which file is active.
-     *   2. Yield to main thread (`yieldToMain`) — guarantees the React state update
-     *      from step 1 has been committed and painted BEFORE heavy CPU work begins.
-     *   3. Read file text via `readFileAsText` (Promise-wrapped FileReader).
-     *   4. Yield again — lets the browser repaint between I/O and CPU phases.
-     *   5. Run `extractValidTableData` (synchronous, CPU-bound) on the raw text.
-     *   6. Increment `loadingState.current` to advance the progress arc/bar.
-     *   7. Yield once more — allows the progress UI to update before next iteration.
-     *
-     * After all files are processed:
-     *   - Merge new results into existing `dataSets` and re-sort by natural filename order.
-     *   - Dismiss the overlay by resetting `loadingState` to `DEFAULT_LOADING_STATE`.
+     * PHASE 2 — RENDER:
+     *   1. Transition `loadingState.phase` to `'rendering'` — spinner shows "Rendering Table…"
+     *   2. Yield to main thread so React paints the phase-change message
+     *   3. Commit staged `newResults` into `dataSets` via `setDataSets`
+     *   4. The `useEffect` watching `loadingState.phase === 'rendering'` takes over:
+     *      it waits for double-rAF paint confirmation, then dismisses the overlay.
      */
-    const processFilesAsync = async (files: File[]) => {
+    const processFilesAsync = useCallback(async (files: File[]) => {
         const total = files.length;
 
-        // Activate the overlay immediately — show 0 of N
-        setLoadingState({ active: true, current: 0, total, fileName: '' });
+        // Activate the overlay immediately — show 0 of N, phase = parsing
+        setLoadingState({ active: true, phase: 'parsing', current: 0, total, fileName: '' });
 
         // Yield so the overlay mounts and paints before any heavy work
         await yieldToMain();
 
         const newResults: DataSet[] = [];
 
+        // --- PHASE 1: Sequential parse with yield points ---
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
 
@@ -518,18 +635,29 @@ const App: React.FC = () => {
             await yieldToMain();
         }
 
-        // Merge results into existing datasets with natural sort
+        // --- PHASE 2: Transition to rendering phase ---
+        // Switch spinner message to "Rendering…" BEFORE committing data
+        setLoadingState(prev => ({
+            ...prev,
+            phase: 'rendering',
+            fileName: '',
+        }));
+
+        // Yield so the "Rendering…" message paints before the heavy setDataSets commit
+        await yieldToMain();
+
+        // Commit all parsed data into React state — triggers expensive reconciliation
         setDataSets(prev => {
             const combined = [...prev, ...newResults];
             return combined.sort((a, b) => naturalCollator.compare(a.fileName, b.fileName));
         });
 
-        // Dismiss overlay
-        setLoadingState(DEFAULT_LOADING_STATE);
-    };
+        // The useEffect watching `phase === 'rendering'` will handle paint detection
+        // and dismiss the overlay after the DOM has fully rendered.
+    }, []);
 
-    // --- FILE INPUT HANDLER (now delegates to async pipeline) ---
-    const handleFileUpload = (e: ChangeEvent<HTMLInputElement>) => {
+    // --- FILE INPUT HANDLER (delegates to async pipeline) ---
+    const handleFileUpload = useCallback((e: ChangeEvent<HTMLInputElement>) => {
         const files = e.target.files;
         if (!files || files.length === 0) return;
 
@@ -541,7 +669,7 @@ const App: React.FC = () => {
             console.error('Unexpected error in file processing pipeline:', err);
             setLoadingState(DEFAULT_LOADING_STATE); // Always dismiss overlay on catastrophic error
         });
-    };
+    }, [processFilesAsync]);
 
     const handleClearData = () => {
         setDataSets([]);
