@@ -21,12 +21,14 @@
  * MODULES & FEATURES:
  * 1. [Types & State Management]
  * - `AppSettings`: Stores UI/UX settings (theme, header configurations,
- * multi-file merge state, custom column name mappings, and structural sticky flags).
+ * multi-file merge state, custom column name mappings, column type overrides,
+ * and structural sticky flags).
  * - `DataSet`: Represents a parsed CSV file with cleaned table rows.
+ * - `SortState`: Tracks current sort column index and direction (asc/desc/null).
  * - Settings are initialized SYNCHRONOUSLY from `localStorage` to prevent
  * race conditions and theme flickering during development/strict mode.
  * - Export/Import settings to JSON allows multi-project configurations,
- * including persistence of custom column headers, merge, and sticky toggles.
+ * including persistence of custom column headers, types, merge, and sticky toggles.
  *
  * 2. [Heuristic CSV Parser (`parseCSVRow` & `extractValidTableData`)]
  * - Fidelity CSVs contain unstructured preamble/postamble.
@@ -98,6 +100,26 @@
  * - Settings that DON'T cause layout restructuring (theme, stickyHeaders) bypass
  *   this mechanism entirely and apply instantly.
  *
+ * 8. [Column Type System & Smart Sort Engine]
+ * - Each column can be assigned a `ColumnType` that controls sort comparison behavior.
+ * - Supported types:
+ *     a) `'string'`   — Default. Natural sort via `Intl.Collator` (numeric-aware).
+ *     b) `'number'`   — Parses raw numeric strings, strips commas/whitespace.
+ *     c) `'percent'`  — Strips trailing `%` and sorts numerically.
+ *     d) `'currency'` — Strips `$`, commas, parens (negative), sorts numerically.
+ *     e) `'marketcap'`— Extracts embedded dollar amount with suffix multiplier:
+ *                        "Large cap ($309.84B)" → 309.84 × 1e9. Handles K/M/B/T suffixes.
+ * - Auto-detection: `detectColumnType` samples the first N non-empty values in a column
+ *   and uses regex pattern matching to infer the most likely type. Falls back to `'string'`.
+ * - Manual override: Users can right-click or use a dropdown (future) on a column header
+ *   to force a specific type, stored in `settings.columnTypeOverrides[colIndex]`.
+ * - Sort state (`SortState`) tracks `{ columnIndex, direction }` and is reset when
+ *   switching tabs or toggling merge mode.
+ * - The comparator function `getComparator` returns a type-aware comparison function
+ *   that handles null/empty values consistently (always sorted to the end).
+ * - In Merge View, each file block is sorted independently using the same sort state,
+ *   maintaining per-block row order while allowing cross-file column sorting.
+ *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
  * - Custom SVGs inline to avoid dependency bloat.
@@ -109,6 +131,50 @@ import React, { useState, useEffect, useRef, useMemo, useCallback, ChangeEvent }
 import { createRoot } from 'react-dom/client';
 
 // --- TYPES ---
+
+/**
+ * Column data type identifiers for the smart sort engine.
+ *
+ * Each type has a dedicated value extractor in `extractSortValue` that
+ * converts the raw cell string into a comparable numeric or string value.
+ *
+ * - 'string':    Natural sort via Intl.Collator (numeric-aware). Default fallback.
+ * - 'number':    Raw numeric parsing. Strips commas, whitespace. "1,234.56" → 1234.56
+ * - 'percent':   Strips trailing '%'. "14.20%" → 14.20
+ * - 'currency':  Strips '$', commas, handles parens-as-negative. "($1,234.56)" → -1234.56
+ * - 'marketcap': Extracts embedded dollar amount with K/M/B/T suffix multiplier.
+ *                "Large cap ($309.84B)" → 309840000000. Also handles standalone "$14.20B".
+ */
+type ColumnType = 'string' | 'number' | 'percent' | 'currency' | 'marketcap';
+
+/**
+ * All available column types for UI display and selection.
+ * Order matters — used for cycling through types and for dropdown rendering.
+ */
+const ALL_COLUMN_TYPES: ColumnType[] = ['string', 'number', 'percent', 'currency', 'marketcap'];
+
+/**
+ * Human-readable labels for column types, used in the type badge UI.
+ */
+const COLUMN_TYPE_LABELS: Record<ColumnType, string> = {
+    string: 'ABC',
+    number: '123',
+    percent: '%',
+    currency: '$',
+    marketcap: 'Cap',
+};
+
+/**
+ * Color classes for column type badges (Tailwind).
+ */
+const COLUMN_TYPE_COLORS: Record<ColumnType, string> = {
+    string: 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300',
+    number: 'bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300',
+    percent: 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300',
+    currency: 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300',
+    marketcap: 'bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300',
+};
+
 interface AppSettings {
     theme: 'light' | 'dark';
     firstRowIsHeader: boolean;
@@ -116,6 +182,7 @@ interface AppSettings {
     mergeFiles: boolean; // Enables infinite layout merging
     stickyHeaders: boolean; // Explicit control switch to force lock headers during scroll
     columnCustomNames: Record<number, string>; // Stores custom column names by index
+    columnTypeOverrides: Record<number, ColumnType>; // Manual type overrides by column index
 }
 
 interface DataSet {
@@ -124,20 +191,17 @@ interface DataSet {
 }
 
 /**
+ * Tracks the current sort state for the table view.
+ * - `columnIndex`: Which column is being sorted (null = no sort active).
+ * - `direction`: 'asc' for ascending, 'desc' for descending.
+ */
+interface SortState {
+    columnIndex: number | null;
+    direction: 'asc' | 'desc';
+}
+
+/**
  * Two-phase loading state tracker.
- *
- * Phase lifecycle:
- *   idle → 'parsing' (files being read + parsed) → 'rendering' (data committed to
- *   React state, DOM reconciliation in progress) → idle (paint confirmed)
- *
- * For settings toggles, the lifecycle is shorter:
- *   idle → 'rendering' (setting committed, DOM restructuring) → idle (paint confirmed)
- *
- * - `active`: Whether the loading overlay should be visible.
- * - `phase`: Current pipeline phase — drives spinner messaging.
- * - `current`: How many files have been fully processed so far (parse phase).
- * - `total`: Total files in the current import batch.
- * - `fileName`: The name of the file currently being parsed (for display).
  */
 interface LoadingState {
     active: boolean;
@@ -154,6 +218,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     mergeFiles: false,       // DISABLED BY DEFAULT
     stickyHeaders: true,     // ENABLED BY DEFAULT (Enforces fixed layout visibility)
     columnCustomNames: {},
+    columnTypeOverrides: {},  // No overrides by default — auto-detection used
 };
 
 const DEFAULT_LOADING_STATE: LoadingState = {
@@ -164,18 +229,24 @@ const DEFAULT_LOADING_STATE: LoadingState = {
     fileName: '',
 };
 
+const DEFAULT_SORT_STATE: SortState = {
+    columnIndex: null,
+    direction: 'asc',
+};
+
 /**
  * Minimum total row count across all loaded datasets before a setting toggle
- * will trigger the spinner overlay. Below this threshold, the DOM reconciliation
- * is fast enough that no spinner is needed. Tune based on target hardware.
+ * will trigger the spinner overlay.
  */
 const EXPENSIVE_TOGGLE_ROW_THRESHOLD = 500;
 
 /**
+ * Number of non-empty cell values to sample per column for auto-type detection.
+ */
+const TYPE_DETECTION_SAMPLE_SIZE = 20;
+
+/**
  * Set of setting keys that cause structural DOM changes (layout rebuild).
- * These are the toggles that get routed through the spinner-protected path
- * when sufficient data is loaded. Other keys (theme, stickyHeaders) are
- * purely CSS changes and never need spinner protection.
  */
 const LAYOUT_RESTRUCTURING_KEYS: Set<keyof AppSettings> = new Set([
     'mergeFiles',
@@ -260,20 +331,176 @@ function extractValidTableData(rawText: string): string[][] {
     return tableData.length > 0 ? tableData : parsedLines;
 }
 
+// --- COLUMN TYPE DETECTION & SMART VALUE EXTRACTION ---
+
 /**
- * Yields control back to the browser's main thread event loop for one tick.
- * This allows React to commit pending state updates (e.g. spinner repaint)
- * and prevents the tab from appearing frozen during heavy synchronous CPU work.
- * Implemented as a zero-delay Promise<void> wrapping setTimeout.
+ * Regex patterns for column type auto-detection.
+ * Each pattern is tested against sampled cell values to determine the best-fit type.
  */
+const TYPE_PATTERNS: { type: ColumnType; pattern: RegExp }[] = [
+    // Marketcap: "Large cap ($309.84B)", "Small cap ($6.76B)", "$14.20B", "$500M"
+    // Must be checked BEFORE currency to avoid false positive on "$309.84B"
+    { type: 'marketcap', pattern: /\$[\d,.]+\s*[KMBT]/i },
+    // Percent: "14.20%", "-3.5%", "0.00%"
+    { type: 'percent', pattern: /^-?[\d,.]+\s*%$/ },
+    // Currency: "$1,234.56", "($1,234.56)", "$0.00", "-$500"
+    { type: 'currency', pattern: /^[($-]*\$[\d,.]+\)?$/ },
+    // Number: "1234", "1,234.56", "-0.5", "+100"
+    { type: 'number', pattern: /^[+-]?[\d,]+\.?\d*$/ },
+];
+
+/**
+ * Samples up to `TYPE_DETECTION_SAMPLE_SIZE` non-empty values from a column
+ * and uses regex matching to detect the most likely column type.
+ *
+ * Strategy:
+ * 1. Collect non-empty, non-header samples from the column.
+ * 2. For each type pattern, count how many samples match.
+ * 3. If >60% of samples match a pattern, return that type.
+ * 4. Patterns are checked in priority order (marketcap > percent > currency > number).
+ * 5. Falls back to 'string' if no pattern reaches the threshold.
+ */
+function detectColumnType(rows: string[][], colIndex: number): ColumnType {
+    const samples: string[] = [];
+    for (let i = 0; i < rows.length && samples.length < TYPE_DETECTION_SAMPLE_SIZE; i++) {
+        const val = (rows[i][colIndex] || '').trim();
+        if (val !== '' && val !== '--' && val !== 'N/A' && val !== 'n/a') {
+            samples.push(val);
+        }
+    }
+
+    if (samples.length === 0) return 'string';
+
+    const threshold = samples.length * 0.6; // 60% match required
+
+    for (const { type, pattern } of TYPE_PATTERNS) {
+        const matchCount = samples.filter(s => pattern.test(s)).length;
+        if (matchCount >= threshold) {
+            return type;
+        }
+    }
+
+    return 'string';
+}
+
+/**
+ * Suffix multipliers for marketcap parsing.
+ * Maps single-character suffixes to their numeric multiplier.
+ */
+const SUFFIX_MULTIPLIERS: Record<string, number> = {
+    'K': 1e3,
+    'M': 1e6,
+    'B': 1e9,
+    'T': 1e12,
+};
+
+/**
+ * Extracts a numeric sort value from a cell string based on the column type.
+ *
+ * Returns `null` for empty/unparseable values — these are always sorted to the end
+ * regardless of sort direction.
+ *
+ * Type-specific extraction logic:
+ * - string:    Returns the raw string (compared via naturalCollator).
+ * - number:    Strips commas, parses as float. "1,234.56" → 1234.56
+ * - percent:   Strips '%', parses as float. "-3.5%" → -3.5
+ * - currency:  Strips '$', commas. Handles parens-as-negative: "($500)" → -500
+ * - marketcap: Finds embedded dollar amount with suffix. "Large cap ($309.84B)" → 3.0984e11
+ *              Regex: /\$([\d,.]+)\s*([KMBT])/i — extracts base number and multiplier.
+ */
+function extractSortValue(cellValue: string, colType: ColumnType): number | string | null {
+    const trimmed = cellValue.trim();
+    if (trimmed === '' || trimmed === '--' || trimmed === 'N/A' || trimmed === 'n/a') {
+        return null;
+    }
+
+    switch (colType) {
+        case 'number': {
+            const cleaned = trimmed.replace(/,/g, '');
+            const num = parseFloat(cleaned);
+            return isNaN(num) ? null : num;
+        }
+
+        case 'percent': {
+            const cleaned = trimmed.replace(/%/g, '').replace(/,/g, '');
+            const num = parseFloat(cleaned);
+            return isNaN(num) ? null : num;
+        }
+
+        case 'currency': {
+            let cleaned = trimmed.replace(/[$,\s]/g, '');
+            // Handle parentheses as negative: ($500) → -500
+            const isNegative = /^\(.*\)$/.test(trimmed) || trimmed.startsWith('-');
+            cleaned = cleaned.replace(/[()]/g, '').replace(/^-/, '');
+            const num = parseFloat(cleaned);
+            if (isNaN(num)) return null;
+            return isNegative ? -num : num;
+        }
+
+        case 'marketcap': {
+            // Try to find "$NUMBER[SUFFIX]" pattern anywhere in the string
+            const match = trimmed.match(/\$([\d,.]+)\s*([KMBT])/i);
+            if (match) {
+                const base = parseFloat(match[1].replace(/,/g, ''));
+                const suffix = match[2].toUpperCase();
+                const multiplier = SUFFIX_MULTIPLIERS[suffix] || 1;
+                return isNaN(base) ? null : base * multiplier;
+            }
+            // Fallback: try to extract just a dollar amount without suffix
+            const fallbackMatch = trimmed.match(/\$([\d,.]+)/);
+            if (fallbackMatch) {
+                const num = parseFloat(fallbackMatch[1].replace(/,/g, ''));
+                return isNaN(num) ? null : num;
+            }
+            return null;
+        }
+
+        case 'string':
+        default:
+            return trimmed;
+    }
+}
+
+/**
+ * Creates a comparator function for sorting rows by a specific column.
+ *
+ * Null/empty values are always pushed to the END regardless of sort direction.
+ * This prevents blank rows from appearing at the top in descending sorts.
+ *
+ * For 'string' type, uses `naturalCollator.compare` for locale-aware numeric sorting.
+ * For all numeric types, uses standard numeric comparison.
+ */
+function getComparator(
+    colIndex: number,
+    direction: 'asc' | 'desc',
+    colType: ColumnType
+): (a: string[], b: string[]) => number {
+    const dirMultiplier = direction === 'asc' ? 1 : -1;
+
+    return (a: string[], b: string[]) => {
+        const aVal = extractSortValue(a[colIndex] || '', colType);
+        const bVal = extractSortValue(b[colIndex] || '', colType);
+
+        // Nulls always go to the end
+        if (aVal === null && bVal === null) return 0;
+        if (aVal === null) return 1;
+        if (bVal === null) return -1;
+
+        if (colType === 'string') {
+            return dirMultiplier * naturalCollator.compare(aVal as string, bVal as string);
+        }
+
+        // Numeric comparison for all other types
+        return dirMultiplier * ((aVal as number) - (bVal as number));
+    };
+}
+
+// --- UTILITY FUNCTIONS ---
+
 function yieldToMain(): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, 0));
 }
 
-/**
- * Wraps the FileReader API in a Promise so it can be consumed with async/await.
- * Resolves with the raw text content of the file, or rejects on error.
- */
 function readFileAsText(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -283,20 +510,6 @@ function readFileAsText(file: File): Promise<string> {
     });
 }
 
-/**
- * Double-requestAnimationFrame paint gate.
- *
- * Why double rAF?
- * - The first `requestAnimationFrame` callback fires AFTER React has flushed
- *   its DOM mutations but potentially BEFORE the browser has composited/painted.
- * - The second `requestAnimationFrame` (nested inside the first) fires after
- *   the browser has actually rendered the new frame to screen.
- * - This guarantees that any DOM-heavy reconciliation (thousands of table rows)
- *   has been fully painted before we resolve, so dismissing the spinner won't
- *   reveal a still-frozen or partially-rendered page.
- *
- * Returns a Promise<void> that resolves after the confirmed paint.
- */
 function waitForPaint(): Promise<void> {
     return new Promise(resolve => {
         requestAnimationFrame(() => {
@@ -307,10 +520,6 @@ function waitForPaint(): Promise<void> {
     });
 }
 
-/**
- * Counts total data rows across all loaded datasets.
- * Used to decide whether a settings toggle is "expensive" and needs spinner protection.
- */
 function getTotalRowCount(dataSets: DataSet[]): number {
     let total = 0;
     for (const ds of dataSets) {
@@ -322,28 +531,12 @@ function getTotalRowCount(dataSets: DataSet[]): number {
 
 // --- SPINNER OVERLAY COMPONENT ---
 
-/**
- * Full-viewport loading overlay displayed during async CSV file processing
- * AND during expensive layout-restructuring settings toggles.
- *
- * Visual anatomy:
- * - Semi-transparent backdrop with blur to dim but not fully hide existing content.
- * - Animated conic-gradient spinner ring (CSS @keyframes spin via Tailwind `animate-spin`).
- * - Inner pulsing circle with a document SVG icon (parse) or grid icon (render).
- * - Dynamic file counter badge: "Processing X of Y" (parse phase) or "Rendering…" (render phase).
- * - Current filename truncated to prevent layout overflow.
- * - Linear progress bar with animated width transitions.
- *
- * Props:
- * - `state`: The current `LoadingState` snapshot driven by the async pipeline.
- */
 const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
     if (!state.active) return null;
 
     const isParsing = state.phase === 'parsing';
     const isRendering = state.phase === 'rendering';
 
-    // Progress fraction 0..1 for the arc — during rendering phase, show full
     const progressFraction = isRendering
         ? 1
         : state.total > 0
@@ -360,153 +553,70 @@ const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
             aria-label="Loading files, please wait"
             role="status"
         >
-            {/* Card container */}
             <div className="flex flex-col items-center gap-5 bg-white dark:bg-slate-900
                             border border-slate-200 dark:border-slate-700
                             rounded-2xl shadow-2xl px-10 py-8 min-w-[280px] max-w-[380px]">
 
-                {/* Spinner ring + inner icon */}
                 <div className="relative flex items-center justify-center w-20 h-20">
-
-                    {/* Outer track ring (static, dim) */}
-                    <svg
-                        className="absolute inset-0 w-full h-full"
-                        viewBox="0 0 80 80"
-                        fill="none"
-                        aria-hidden="true"
-                    >
-                        <circle
-                            cx="40" cy="40" r="34"
-                            stroke="currentColor"
-                            strokeWidth="6"
-                            className="text-slate-200 dark:text-slate-700"
+                    <svg className="absolute inset-0 w-full h-full" viewBox="0 0 80 80" fill="none" aria-hidden="true">
+                        <circle cx="40" cy="40" r="34" stroke="currentColor" strokeWidth="6" className="text-slate-200 dark:text-slate-700" />
+                    </svg>
+                    <svg className="absolute inset-0 w-full h-full -rotate-90" viewBox="0 0 80 80" fill="none" aria-hidden="true">
+                        <circle cx="40" cy="40" r="34" stroke="currentColor" strokeWidth="6" strokeLinecap="round"
+                                strokeDasharray={`${2 * Math.PI * 34}`}
+                                strokeDashoffset={`${2 * Math.PI * 34 * (1 - progressFraction)}`}
+                                className="text-blue-500 dark:text-blue-400"
+                                style={{ transition: 'stroke-dashoffset 0.35s cubic-bezier(0.4,0,0.2,1)' }}
                         />
                     </svg>
-
-                    {/* Animated progress arc (SVG stroke-dashoffset trick) */}
-                    <svg
-                        className="absolute inset-0 w-full h-full -rotate-90"
-                        viewBox="0 0 80 80"
-                        fill="none"
-                        aria-hidden="true"
-                    >
-                        <circle
-                            cx="40" cy="40" r="34"
-                            stroke="currentColor"
-                            strokeWidth="6"
-                            strokeLinecap="round"
-                            strokeDasharray={`${2 * Math.PI * 34}`}
-                            strokeDashoffset={`${2 * Math.PI * 34 * (1 - progressFraction)}`}
-                            className="text-blue-500 dark:text-blue-400"
-                            style={{ transition: 'stroke-dashoffset 0.35s cubic-bezier(0.4,0,0.2,1)' }}
-                        />
+                    <svg className="absolute inset-0 w-full h-full animate-spin" viewBox="0 0 80 80" fill="none" aria-hidden="true" style={{ animationDuration: '1.1s' }}>
+                        <circle cx="40" cy="40" r="34" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeDasharray="20 193" className="text-blue-400/60 dark:text-blue-300/50" />
                     </svg>
-
-                    {/* Spinning dashed ring (perpetual motion indicator) */}
-                    <svg
-                        className="absolute inset-0 w-full h-full animate-spin"
-                        viewBox="0 0 80 80"
-                        fill="none"
-                        aria-hidden="true"
-                        style={{ animationDuration: '1.1s' }}
-                    >
-                        <circle
-                            cx="40" cy="40" r="34"
-                            stroke="currentColor"
-                            strokeWidth="3"
-                            strokeLinecap="round"
-                            strokeDasharray="20 193"
-                            strokeDashoffset="0"
-                            className="text-blue-400/60 dark:text-blue-300/50"
-                        />
-                    </svg>
-
-                    {/* Inner icon — document with pulse (parse) or grid/table (render) */}
-                    <div className="relative z-10 flex items-center justify-center
-                                    w-11 h-11 rounded-full
-                                    bg-blue-50 dark:bg-blue-950/60
-                                    animate-pulse"
-                         style={{ animationDuration: '1.6s' }}
-                    >
+                    <div className="relative z-10 flex items-center justify-center w-11 h-11 rounded-full bg-blue-50 dark:bg-blue-950/60 animate-pulse" style={{ animationDuration: '1.6s' }}>
                         {isParsing ? (
-                            /* Document icon during parse phase */
-                            <svg
-                                className="w-5 h-5 text-blue-600 dark:text-blue-400"
-                                fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                                aria-hidden="true"
-                            >
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586
-                                         a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19
-                                         a2 2 0 01-2 2z" />
+                            <svg className="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                             </svg>
                         ) : (
-                            /* Grid/table icon during render phase */
-                            <svg
-                                className="w-5 h-5 text-amber-600 dark:text-amber-400"
-                                fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                                aria-hidden="true"
-                            >
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                                      d="M3 10h18M3 14h18M10 3v18M14 3v18" />
+                            <svg className="w-5 h-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M3 14h18M10 3v18M14 3v18" />
                             </svg>
                         )}
                     </div>
                 </div>
 
-                {/* Title — changes by phase */}
                 <div className="flex flex-col items-center gap-1.5 text-center">
                     <p className="text-base font-bold text-slate-800 dark:text-slate-100 tracking-tight">
                         {isParsing ? 'Processing Files…' : 'Rendering Table…'}
                     </p>
-
-                    {/* Phase-aware status badge */}
                     {isParsing ? (
-                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full
-                                         bg-blue-100 dark:bg-blue-900/50
-                                         text-blue-700 dark:text-blue-300
-                                         text-xs font-semibold tracking-wide">
-                            {/* Mini spinner dot */}
+                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-xs font-semibold tracking-wide">
                             <span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse" />
                             {state.current} of {state.total} parsed
                         </span>
                     ) : (
-                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full
-                                         bg-amber-100 dark:bg-amber-900/50
-                                         text-amber-700 dark:text-amber-300
-                                         text-xs font-semibold tracking-wide">
+                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300 text-xs font-semibold tracking-wide">
                             <span className="w-1.5 h-1.5 rounded-full bg-amber-500 dark:bg-amber-400 animate-pulse" />
                             Building DOM layout…
                         </span>
                     )}
                 </div>
 
-                {/* Progress bar */}
                 <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
                     <div
-                        className={`h-full rounded-full transition-all duration-300 ease-out ${
-                            isRendering
-                                ? 'bg-amber-500 dark:bg-amber-400 animate-pulse'
-                                : 'bg-blue-500 dark:bg-blue-400'
-                        }`}
+                        className={`h-full rounded-full transition-all duration-300 ease-out ${isRendering ? 'bg-amber-500 dark:bg-amber-400 animate-pulse' : 'bg-blue-500 dark:bg-blue-400'}`}
                         style={{ width: `${progressPercent}%` }}
                     />
                 </div>
 
-                {/* Current filename (parse phase only) */}
                 {isParsing && state.fileName && (
-                    <p className="text-xs text-slate-400 dark:text-slate-500
-                                  max-w-full truncate text-center font-mono tracking-tight"
-                       title={state.fileName}>
+                    <p className="text-xs text-slate-400 dark:text-slate-500 max-w-full truncate text-center font-mono tracking-tight" title={state.fileName}>
                         {state.fileName}
                     </p>
                 )}
-
-                {/* Render phase sub-hint */}
                 {isRendering && (
                     <p className="text-[11px] text-slate-400 dark:text-slate-500 text-center leading-snug">
-                        Large tables may take a moment to paint.
-                        <br />The spinner will dismiss after the browser finishes.
+                        Large tables may take a moment to paint.<br />The spinner will dismiss after the browser finishes.
                     </p>
                 )}
             </div>
@@ -517,38 +627,6 @@ const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
 
 // --- INLINE HEADER EDIT WIDGET COMPONENT ---
 
-/**
- * Self-contained inline editing widget for column headers.
- *
- * Interaction model:
- * - SAVE pathways:
- *     1. Press `Enter` key while input is focused
- *     2. Click the ✓ (checkmark) button
- *     3. Click away from the widget (blur) — UNLESS cancel was explicitly triggered
- * - CANCEL pathways:
- *     1. Press `Escape` key while input is focused
- *     2. Click the ✗ (cross) button
- *
- * Focus-stealing prevention:
- * - The ✓ and ✗ buttons use `onMouseDown` with `e.preventDefault()` to prevent
- *   them from stealing focus from the input, which would trigger a premature
- *   `onBlur` before the button's `onClick` fires. This is critical because the
- *   browser's event order is: mousedown → blur → mouseup → click. Without
- *   preventDefault on mousedown, the blur handler would fire and potentially save
- *   before the cancel click is registered.
- *
- * Cancel flag (`cancelledRef`):
- * - A `useRef<boolean>` acts as a synchronous flag that survives across the
- *   blur → click event boundary. When Escape or ✗ is pressed, `cancelledRef.current`
- *   is set to `true` BEFORE blur fires, so `handleBlur` knows to skip saving.
- *
- * Props:
- * - `value`: Current edit buffer value (controlled by parent).
- * - `onChange`: Callback when the input text changes.
- * - `onSave`: Callback to persist the current value.
- * - `onCancel`: Callback to discard changes and exit edit mode.
- * - `isMergeView`: Whether the widget is inside the merge layout (affects sizing).
- */
 const InlineHeaderEditor: React.FC<{
     value: string;
     onChange: (val: string) => void;
@@ -556,25 +634,18 @@ const InlineHeaderEditor: React.FC<{
     onCancel: () => void;
     isMergeView?: boolean;
 }> = ({ value, onChange, onSave, onCancel, isMergeView = false }) => {
-    /**
-     * Synchronous cancel flag — set to `true` before blur fires when cancel
-     * is explicitly triggered (Escape key or ✗ button). Checked by `handleBlur`
-     * to decide whether to save or discard.
-     */
     const cancelledRef = useRef(false);
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
         if (e.key === 'Enter') {
             onSave();
         } else if (e.key === 'Escape') {
-            // Set flag BEFORE blur fires (blur is synchronous after Escape in some browsers)
             cancelledRef.current = true;
             onCancel();
         }
     };
 
     const handleBlur = () => {
-        // If cancel was explicitly triggered, don't save — just bail
         if (cancelledRef.current) {
             cancelledRef.current = false;
             return;
@@ -582,23 +653,13 @@ const InlineHeaderEditor: React.FC<{
         onSave();
     };
 
-    /**
-     * Cancel button mousedown handler.
-     * - `e.preventDefault()` prevents this button from stealing focus from the input,
-     *   which would cause a blur event BEFORE onClick fires.
-     * - Sets `cancelledRef.current = true` so if blur still somehow fires, it won't save.
-     */
     const handleCancelMouseDown = (e: React.MouseEvent) => {
-        e.preventDefault(); // Prevent focus steal → premature blur
+        e.preventDefault();
         cancelledRef.current = true;
     };
 
-    /**
-     * Save button mousedown handler.
-     * - `e.preventDefault()` prevents focus steal from the input.
-     */
     const handleSaveMouseDown = (e: React.MouseEvent) => {
-        e.preventDefault(); // Prevent focus steal → premature blur
+        e.preventDefault();
     };
 
     return (
@@ -614,32 +675,169 @@ const InlineHeaderEditor: React.FC<{
                     flex-1 min-w-0 ${isMergeView ? 'py-0.5' : 'py-1'}`}
                 autoFocus
             />
-            {/* ✓ Save button — accessible on touch devices */}
-            <button
-                onMouseDown={handleSaveMouseDown}
-                onClick={onSave}
-                className="shrink-0 p-0.5 rounded text-green-600 dark:text-green-400
-                    hover:bg-green-100 dark:hover:bg-green-900/40 transition-colors"
-                title="Save (Enter)"
-                aria-label="Save column name"
-            >
+            <button onMouseDown={handleSaveMouseDown} onClick={onSave}
+                    className="shrink-0 p-0.5 rounded text-green-600 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-900/40 transition-colors"
+                    title="Save (Enter)" aria-label="Save column name">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
                 </svg>
             </button>
-            {/* ✗ Cancel button — accessible on touch devices */}
-            <button
-                onMouseDown={handleCancelMouseDown}
-                onClick={onCancel}
-                className="shrink-0 p-0.5 rounded text-red-500 dark:text-red-400
-                    hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
-                title="Cancel (Esc)"
-                aria-label="Cancel editing"
-            >
+            <button onMouseDown={handleCancelMouseDown} onClick={onCancel}
+                    className="shrink-0 p-0.5 rounded text-red-500 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
+                    title="Cancel (Esc)" aria-label="Cancel editing">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
                 </svg>
             </button>
+        </div>
+    );
+};
+
+
+// --- COLUMN HEADER DISPLAY COMPONENT (with sort + type + edit) ---
+
+/**
+ * Renders a single column header cell with:
+ * - Column name (editable inline)
+ * - Sort direction triangles (▲/▼) — visible on hover, highlighted when active
+ * - Column type badge — clickable to cycle through types
+ * - Edit (pencil) button — visible on hover
+ *
+ * The sort triangles are stacked vertically beside the column name.
+ * Clicking ▲ sets ascending sort; clicking ▼ sets descending.
+ * Clicking the already-active direction clears the sort (resets to natural order).
+ *
+ * The type badge shows the auto-detected or manually overridden column type
+ * as a tiny pill (e.g., "ABC", "123", "%", "$", "Cap"). Clicking cycles to next type.
+ */
+const ColumnHeader: React.FC<{
+    header: string;
+    colIndex: number;
+    fileIndex: number;
+    sortState: SortState;
+    colType: ColumnType;
+    isEditing: boolean;
+    editValue: string;
+    onEditChange: (val: string) => void;
+    onEditStart: () => void;
+    onEditSave: () => void;
+    onEditCancel: () => void;
+    onSort: (colIndex: number, direction: 'asc' | 'desc') => void;
+    onTypeChange: (colIndex: number, newType: ColumnType) => void;
+    isMergeView?: boolean;
+}> = ({
+          header, colIndex, fileIndex, sortState, colType, isEditing,
+          editValue, onEditChange, onEditStart, onEditSave, onEditCancel,
+          onSort, onTypeChange, isMergeView = false,
+      }) => {
+    const isActiveSort = sortState.columnIndex === colIndex;
+    const isAsc = isActiveSort && sortState.direction === 'asc';
+    const isDesc = isActiveSort && sortState.direction === 'desc';
+
+    /**
+     * Handles clicking a sort triangle.
+     * - If clicking the already-active direction → clears sort (pass colIndex with toggled dir,
+     *   but we use a special "clear" signal by passing the same direction to parent which handles toggle).
+     * - If clicking inactive direction → activates that direction.
+     */
+    const handleSortClick = (direction: 'asc' | 'desc') => {
+        onSort(colIndex, direction);
+    };
+
+    /**
+     * Cycles column type to the next in the ALL_COLUMN_TYPES array.
+     */
+    const handleTypeCycle = (e: React.MouseEvent) => {
+        e.stopPropagation(); // Don't trigger any parent click handlers
+        const currentIdx = ALL_COLUMN_TYPES.indexOf(colType);
+        const nextIdx = (currentIdx + 1) % ALL_COLUMN_TYPES.length;
+        onTypeChange(colIndex, ALL_COLUMN_TYPES[nextIdx]);
+    };
+
+    if (isEditing) {
+        return (
+            <InlineHeaderEditor
+                value={editValue}
+                onChange={onEditChange}
+                onSave={onEditSave}
+                onCancel={onEditCancel}
+                isMergeView={isMergeView}
+            />
+        );
+    }
+
+    return (
+        <div className="flex items-center justify-between gap-1 w-full group/header">
+            {/* Sort triangles — stacked vertically */}
+            <div className="flex flex-col shrink-0 -my-1 opacity-0 group-hover/header:opacity-100 transition-opacity">
+                <button
+                    onClick={() => handleSortClick('asc')}
+                    className={`p-0 leading-none transition-colors ${
+                        isAsc
+                            ? 'text-blue-600 dark:text-blue-400'
+                            : 'text-slate-300 dark:text-slate-600 hover:text-slate-500 dark:hover:text-slate-400'
+                    }`}
+                    title="Sort Ascending"
+                    aria-label={`Sort ${header} ascending`}
+                >
+                    <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                        <path d="M6 2L10 8H2L6 2Z" />
+                    </svg>
+                </button>
+                <button
+                    onClick={() => handleSortClick('desc')}
+                    className={`p-0 leading-none transition-colors ${
+                        isDesc
+                            ? 'text-blue-600 dark:text-blue-400'
+                            : 'text-slate-300 dark:text-slate-600 hover:text-slate-500 dark:hover:text-slate-400'
+                    }`}
+                    title="Sort Descending"
+                    aria-label={`Sort ${header} descending`}
+                >
+                    <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                        <path d="M6 10L2 4H10L6 10Z" />
+                    </svg>
+                </button>
+            </div>
+
+            {/* Column name */}
+            <span className={`truncate flex-1 ${isMergeView ? '' : 'font-semibold'}`}>{header}</span>
+
+            {/* Type badge — always visible when sort is active or on hover */}
+            <button
+                onClick={handleTypeCycle}
+                className={`shrink-0 px-1.5 py-0 rounded text-[9px] font-bold leading-4 tracking-wide
+                    transition-all cursor-pointer border border-transparent
+                    hover:border-slate-400 dark:hover:border-slate-500
+                    ${isActiveSort ? 'opacity-100' : 'opacity-0 group-hover/header:opacity-70'}
+                    ${COLUMN_TYPE_COLORS[colType]}`}
+                title={`Column type: ${colType}. Click to cycle.`}
+                aria-label={`Column type: ${colType}`}
+            >
+                {COLUMN_TYPE_LABELS[colType]}
+            </button>
+
+            {/* Edit (pencil) button */}
+            <button
+                onClick={onEditStart}
+                className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-0.5 shrink-0"
+                title="Rename Column"
+            >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                </svg>
+            </button>
+
+            {/* Active sort indicator — persistently visible when this column is sorted */}
+            {isActiveSort && (
+                <span className="shrink-0 text-blue-500 dark:text-blue-400" aria-hidden="true">
+                    {isAsc ? (
+                        <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor"><path d="M6 2L10 8H2L6 2Z" /></svg>
+                    ) : (
+                        <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor"><path d="M6 10L2 4H10L6 10Z" /></svg>
+                    )}
+                </span>
+            )}
         </div>
     );
 };
@@ -665,22 +863,18 @@ const App: React.FC = () => {
 
     const [dataSets, setDataSets] = useState<DataSet[]>([]);
     const [activeTab, setActiveTab] = useState<number>(0);
-
-    // Two-phase async pipeline loading state — drives the overlay spinner
     const [loadingState, setLoadingState] = useState<LoadingState>(DEFAULT_LOADING_STATE);
+    const [sortState, setSortState] = useState<SortState>(DEFAULT_SORT_STATE);
 
     // UI Local State for inline renaming
-    // Updated to track composite string keys (fileIdx-colIdx) to prevent focus stealing in Merge Mode
     const [editingHeaderKey, setEditingHeaderKey] = useState<string | null>(null);
     const [editHeaderValue, setEditHeaderValue] = useState<string>('');
 
-    // DOM references for unified file triggers
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    // --- SINGLE EFFECT FOR THEME & CACHE SYNCHRONIZATION ---
+    // --- THEME & CACHE SYNC ---
     useEffect(() => {
         localStorage.setItem('fidelityApp_settings', JSON.stringify(settings));
-
         if (settings.theme === 'dark') {
             document.documentElement.classList.add('dark');
         } else {
@@ -688,108 +882,50 @@ const App: React.FC = () => {
         }
     }, [settings]);
 
-    /**
-     * PHASE 2 PAINT DETECTION EFFECT
-     *
-     * When `loadingState.phase` transitions to `'rendering'`, React has already
-     * committed the new state change (either `dataSets` from file import, or
-     * `settings` from a layout toggle). This effect waits for the browser to
-     * fully paint the resulting DOM changes using double-rAF gating, then
-     * dismisses the spinner.
-     *
-     * This single effect handles BOTH:
-     * - File import pipeline (Phase 2 after parsing)
-     * - Settings toggle protection (mergeFiles, firstRowIsHeader, firstColIsHeader)
-     */
+    // --- PAINT DETECTION EFFECT ---
     useEffect(() => {
         if (loadingState.phase !== 'rendering') return;
-
         let cancelled = false;
-
         const detectPaintAndDismiss = async () => {
-            // Wait for React's committed DOM changes to be actually painted
             await waitForPaint();
-
-            // Extra safety yield — for very large DOMs, the browser may need
-            // one more frame to finish layout/compositing
             await waitForPaint();
-
-            if (!cancelled) {
-                setLoadingState(DEFAULT_LOADING_STATE);
-            }
+            if (!cancelled) setLoadingState(DEFAULT_LOADING_STATE);
         };
-
         detectPaintAndDismiss();
-
-        // Cleanup in case the component unmounts during the wait
         return () => { cancelled = true; };
     }, [loadingState.phase]);
 
-    /**
-     * Instant setting update — used for settings that don't cause layout restructuring
-     * (e.g. theme, stickyHeaders). No spinner needed.
-     */
+    // --- Reset sort when switching tabs or toggling merge ---
+    useEffect(() => {
+        setSortState(DEFAULT_SORT_STATE);
+    }, [activeTab, settings.mergeFiles]);
+
     const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
         setSettings(prev => ({ ...prev, [key]: value }));
     };
 
-    /**
-     * Protected setting update with rendering spinner.
-     *
-     * For settings in `LAYOUT_RESTRUCTURING_KEYS` that would cause massive DOM
-     * reconciliation when data is loaded above `EXPENSIVE_TOGGLE_ROW_THRESHOLD`:
-     *
-     * 1. Show spinner in 'rendering' phase → yield so it paints
-     * 2. Commit the setting change (triggers expensive re-render)
-     * 3. The `renderPhaseEffect` detects `phase === 'rendering'` and waits for
-     *    double-rAF paint confirmation → dismisses spinner
-     *
-     * If data volume is below threshold, falls through to instant `updateSetting`.
-     */
     const updateSettingWithSpinner = useCallback(async <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
         const totalRows = getTotalRowCount(dataSets);
         const isExpensive = LAYOUT_RESTRUCTURING_KEYS.has(key) && totalRows >= EXPENSIVE_TOGGLE_ROW_THRESHOLD;
 
         if (!isExpensive) {
-            // Fast path — no spinner needed
             setSettings(prev => ({ ...prev, [key]: value }));
             return;
         }
 
-        // Slow path — show rendering spinner before committing
-        setLoadingState({
-            active: true,
-            phase: 'rendering',
-            current: 0,
-            total: 0,
-            fileName: '',
-        });
-
-        // Yield so the spinner overlay mounts and paints BEFORE the heavy state change
+        setLoadingState({ active: true, phase: 'rendering', current: 0, total: 0, fileName: '' });
         await yieldToMain();
-
-        // Commit the setting — this triggers the expensive React reconciliation
         setSettings(prev => ({ ...prev, [key]: value }));
-
-        // The useEffect watching `phase === 'rendering'` handles paint detection
-        // and auto-dismisses the spinner after the DOM settles.
     }, [dataSets]);
 
     const handleResetSettings = useCallback(async () => {
         const totalRows = getTotalRowCount(dataSets);
-
         if (totalRows >= EXPENSIVE_TOGGLE_ROW_THRESHOLD) {
-            setLoadingState({
-                active: true,
-                phase: 'rendering',
-                current: 0,
-                total: 0,
-                fileName: '',
-            });
+            setLoadingState({ active: true, phase: 'rendering', current: 0, total: 0, fileName: '' });
             await yieldToMain();
         }
-
         setSettings(DEFAULT_SETTINGS);
+        setSortState(DEFAULT_SORT_STATE);
     }, [dataSets]);
 
     const handleExportSettings = () => {
@@ -811,18 +947,10 @@ const App: React.FC = () => {
                 const imported = JSON.parse(event.target?.result as string);
                 if (imported && typeof imported === 'object') {
                     const totalRows = getTotalRowCount(dataSets);
-
                     if (totalRows >= EXPENSIVE_TOGGLE_ROW_THRESHOLD) {
-                        setLoadingState({
-                            active: true,
-                            phase: 'rendering',
-                            current: 0,
-                            total: 0,
-                            fileName: '',
-                        });
+                        setLoadingState({ active: true, phase: 'rendering', current: 0, total: 0, fileName: '' });
                         await yieldToMain();
                     }
-
                     setSettings({ ...DEFAULT_SETTINGS, ...imported });
                 }
             } catch (err) {
@@ -830,172 +958,178 @@ const App: React.FC = () => {
             }
         };
         reader.readAsText(file);
-        e.target.value = ''; // reset input
+        e.target.value = '';
     }, [dataSets]);
 
-    const handleTriggerFileInput = () => {
-        fileInputRef.current?.click();
-    };
+    const handleTriggerFileInput = () => fileInputRef.current?.click();
 
-    // --- TWO-PHASE ASYNC FILE PROCESSING PIPELINE ---
-    /**
-     * PHASE 1 — PARSE:
-     *   For each file sequentially:
-     *     1. Update `loadingState.fileName` → yield → (spinner repaints with filename)
-     *     2. Read file via `readFileAsText` → yield → (browser breathes between I/O and CPU)
-     *     3. Run `extractValidTableData` (CPU-heavy, synchronous)
-     *     4. Increment `loadingState.current` → yield → (progress bar advances)
-     *   Results accumulate in a local `newResults[]` staging array.
-     *
-     * PHASE 2 — RENDER:
-     *   1. Transition `loadingState.phase` to `'rendering'` — spinner shows "Rendering Table…"
-     *   2. Yield to main thread so React paints the phase-change message
-     *   3. Commit staged `newResults` into `dataSets` via `setDataSets`
-     *   4. The `useEffect` watching `loadingState.phase === 'rendering'` takes over:
-     *      it waits for double-rAF paint confirmation, then dismisses the overlay.
-     */
+    // --- FILE PROCESSING PIPELINE ---
     const processFilesAsync = useCallback(async (files: File[]) => {
         const total = files.length;
-
-        // Activate the overlay immediately — show 0 of N, phase = parsing
         setLoadingState({ active: true, phase: 'parsing', current: 0, total, fileName: '' });
-
-        // Yield so the overlay mounts and paints before any heavy work
         await yieldToMain();
 
         const newResults: DataSet[] = [];
 
-        // --- PHASE 1: Sequential parse with yield points ---
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
-
-            // Show which file is currently being parsed
             setLoadingState(prev => ({ ...prev, fileName: file.name }));
-
-            // Yield: let React commit the fileName update before blocking CPU
             await yieldToMain();
-
             try {
                 const rawText = await readFileAsText(file);
-
-                // Yield between I/O completion and CPU-heavy parse
                 await yieldToMain();
-
                 const cleanedData = extractValidTableData(rawText);
                 newResults.push({ fileName: file.name, data: cleanedData });
             } catch (err) {
                 console.error(`Error processing ${file.name}:`, err);
-                // Continue with remaining files even if one fails
             }
-
-            // Advance the progress counter
             setLoadingState(prev => ({ ...prev, current: i + 1 }));
-
-            // Yield: let the progress arc animate before the next heavy iteration
             await yieldToMain();
         }
 
-        // --- PHASE 2: Transition to rendering phase ---
-        // Switch spinner message to "Rendering…" BEFORE committing data
-        setLoadingState(prev => ({
-            ...prev,
-            phase: 'rendering',
-            fileName: '',
-        }));
-
-        // Yield so the "Rendering…" message paints before the heavy setDataSets commit
+        setLoadingState(prev => ({ ...prev, phase: 'rendering', fileName: '' }));
         await yieldToMain();
 
-        // Commit all parsed data into React state — triggers expensive reconciliation
         setDataSets(prev => {
             const combined = [...prev, ...newResults];
             return combined.sort((a, b) => naturalCollator.compare(a.fileName, b.fileName));
         });
-
-        // The useEffect watching `phase === 'rendering'` will handle paint detection
-        // and dismiss the overlay after the DOM has fully rendered.
     }, []);
 
-    // --- FILE INPUT HANDLER (delegates to async pipeline) ---
     const handleFileUpload = useCallback((e: ChangeEvent<HTMLInputElement>) => {
         const files = e.target.files;
         if (!files || files.length === 0) return;
-
         const fileArray = Array.from(files);
-        e.target.value = ''; // Reset input immediately so the same files can be re-selected
-
-        // Fire-and-forget the async pipeline; errors are caught internally
+        e.target.value = '';
         processFilesAsync(fileArray).catch(err => {
             console.error('Unexpected error in file processing pipeline:', err);
-            setLoadingState(DEFAULT_LOADING_STATE); // Always dismiss overlay on catastrophic error
+            setLoadingState(DEFAULT_LOADING_STATE);
         });
     }, [processFilesAsync]);
 
     const handleClearData = () => {
         setDataSets([]);
         setActiveTab(0);
+        setSortState(DEFAULT_SORT_STATE);
     };
 
-    // --- INLINE EDITING FUNCTIONS ---
+    // --- INLINE EDITING ---
     const startEditingHeader = (fileIndex: number, colIndex: number, currentValue: string) => {
         setEditingHeaderKey(`${fileIndex}-${colIndex}`);
         setEditHeaderValue(currentValue);
     };
 
-    /**
-     * Saves the current edit buffer value into `settings.columnCustomNames`
-     * for the given column index, then exits edit mode.
-     */
     const saveHeaderName = (colIndex: number) => {
         if (editHeaderValue.trim() !== '') {
             setSettings(prev => ({
                 ...prev,
-                columnCustomNames: {
-                    ...prev.columnCustomNames,
-                    [colIndex]: editHeaderValue.trim()
-                }
+                columnCustomNames: { ...prev.columnCustomNames, [colIndex]: editHeaderValue.trim() }
             }));
         }
         setEditingHeaderKey(null);
     };
 
-    /**
-     * Cancels the current inline header edit without saving.
-     * Simply exits edit mode, discarding `editHeaderValue`.
-     */
     const cancelEditingHeader = () => {
         setEditingHeaderKey(null);
         setEditHeaderValue('');
     };
 
-    // --- DATA TRANSFORMATION SUB-ROUTINE ---
-    const getFileHeadersAndRows = (fileRawRows: string[][]) => {
+    // --- SORT HANDLER ---
+    /**
+     * Handles sort toggle logic:
+     * - If clicking the same column + same direction → clears sort (back to natural order).
+     * - If clicking same column + different direction → switches direction.
+     * - If clicking different column → sets new column + requested direction.
+     */
+    const handleSort = useCallback((colIndex: number, direction: 'asc' | 'desc') => {
+        setSortState(prev => {
+            if (prev.columnIndex === colIndex && prev.direction === direction) {
+                // Clicking active sort direction again → clear sort
+                return DEFAULT_SORT_STATE;
+            }
+            return { columnIndex: colIndex, direction };
+        });
+    }, []);
+
+    // --- COLUMN TYPE HANDLER ---
+    /**
+     * Sets the column type override. Persisted to settings for export/import.
+     * Also resets sort when type changes since comparison semantics change.
+     */
+    const handleTypeChange = useCallback((colIndex: number, newType: ColumnType) => {
+        setSettings(prev => ({
+            ...prev,
+            columnTypeOverrides: { ...prev.columnTypeOverrides, [colIndex]: newType }
+        }));
+        // Reset sort since the comparison function changes with type
+        setSortState(DEFAULT_SORT_STATE);
+    }, []);
+
+    // --- DATA TRANSFORMATION ---
+    const getFileHeadersAndRows = useCallback((fileRawRows: string[][]) => {
         if (fileRawRows.length === 0) return { headers: [], rows: [] };
 
         const totalColumns = fileRawRows[0].length;
         const fileHeaders = settings.firstRowIsHeader ? fileRawRows[0] : [];
 
         const headers = Array.from({ length: totalColumns }, (_, i) => {
-            if (settings.columnCustomNames[i]) {
-                return settings.columnCustomNames[i];
-            }
-            if (settings.firstRowIsHeader && fileHeaders[i]) {
-                return fileHeaders[i];
-            }
+            if (settings.columnCustomNames[i]) return settings.columnCustomNames[i];
+            if (settings.firstRowIsHeader && fileHeaders[i]) return fileHeaders[i];
             return `Col ${i + 1}`;
         });
 
         const rows = settings.firstRowIsHeader ? fileRawRows.slice(1) : fileRawRows;
         return { headers, rows };
-    };
+    }, [settings.firstRowIsHeader, settings.columnCustomNames]);
+
+    /**
+     * Determines the effective column type for a given column index:
+     * 1. If user has a manual override → use that.
+     * 2. Otherwise → auto-detect from the data rows.
+     */
+    const getColumnType = useCallback((colIndex: number, dataRows: string[][]): ColumnType => {
+        if (settings.columnTypeOverrides[colIndex]) {
+            return settings.columnTypeOverrides[colIndex];
+        }
+        return detectColumnType(dataRows, colIndex);
+    }, [settings.columnTypeOverrides]);
+
+    /**
+     * Applies the current sort state to a set of rows.
+     * Returns a new sorted array (does not mutate the original).
+     * If no sort is active, returns the original reference for performance.
+     */
+    const applySortToRows = useCallback((rows: string[][], dataRows: string[][]): string[][] => {
+        if (sortState.columnIndex === null) return rows;
+
+        const colType = getColumnType(sortState.columnIndex, dataRows);
+        const comparator = getComparator(sortState.columnIndex, sortState.direction, colType);
+
+        return [...rows].sort(comparator);
+    }, [sortState, getColumnType]);
 
     const activeData = dataSets[activeTab]?.data || [];
-    const isolatedTable = useMemo(() => getFileHeadersAndRows(activeData), [activeData, settings.firstRowIsHeader, settings.columnCustomNames]);
+
+    const isolatedTable = useMemo(() => {
+        const { headers, rows } = getFileHeadersAndRows(activeData);
+        const sortedRows = applySortToRows(rows, rows);
+        return { headers, rows: sortedRows };
+    }, [activeData, getFileHeadersAndRows, applySortToRows]);
+
+    /**
+     * Computes auto-detected column types for the current view.
+     * Used to show the correct type badge on each header.
+     * Memoized to avoid re-detecting on every render.
+     */
+    const activeColumnTypes = useMemo((): ColumnType[] => {
+        const dataRows = settings.firstRowIsHeader ? activeData.slice(1) : activeData;
+        if (dataRows.length === 0) return [];
+        const colCount = dataRows[0]?.length || 0;
+        return Array.from({ length: colCount }, (_, i) => getColumnType(i, dataRows));
+    }, [activeData, settings.firstRowIsHeader, getColumnType]);
 
     return (
         <>
-            {/* LOADING OVERLAY — rendered outside the main layout flow via fragment
-                so it can use fixed positioning without being clipped by overflow:hidden ancestors */}
             <LoadingOverlay state={loadingState} />
 
             <div className="h-screen bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100 transition-colors duration-300 font-sans flex flex-col overflow-hidden">
@@ -1007,7 +1141,6 @@ const App: React.FC = () => {
                         <h1 className="text-xl font-bold tracking-tight">Fidelity Data Cleaner</h1>
                     </div>
 
-                    {/* SETTINGS BAR */}
                     <div className="flex flex-wrap items-center gap-3 text-sm">
                         <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
                             <input type="checkbox" checked={settings.stickyHeaders} onChange={(e) => updateSetting('stickyHeaders', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
@@ -1035,39 +1168,25 @@ const App: React.FC = () => {
                     </div>
                 </header>
 
-                {/* MAIN CONTENT CONTAINER */}
+                {/* MAIN CONTENT */}
                 <main className="flex-1 flex flex-col p-4 gap-4 max-w-full overflow-hidden min-h-0 bg-slate-50 dark:bg-slate-900 transition-colors duration-300">
 
-                    <input
-                        type="file"
-                        ref={fileInputRef}
-                        multiple
-                        accept=".csv"
-                        className="hidden"
-                        onChange={handleFileUpload}
-                    />
+                    <input type="file" ref={fileInputRef} multiple accept=".csv" className="hidden" onChange={handleFileUpload} />
 
-                    {/* CONTROLS & IMPORT */}
+                    {/* CONTROLS */}
                     <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-slate-950 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm shrink-0">
                         <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
-                            <button
-                                onClick={handleTriggerFileInput}
-                                disabled={loadingState.active}
-                                className="cursor-pointer bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm"
-                            >
+                            <button onClick={handleTriggerFileInput} disabled={loadingState.active}
+                                    className="cursor-pointer bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm">
                                 Import CSV Files
                             </button>
                             {dataSets.length > 0 && (
-                                <button
-                                    onClick={handleClearData}
-                                    disabled={loadingState.active}
-                                    className="text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 rounded-lg font-semibold transition-colors"
-                                >
+                                <button onClick={handleClearData} disabled={loadingState.active}
+                                        className="text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 rounded-lg font-semibold transition-colors">
                                     Clear Data
                                 </button>
                             )}
                         </div>
-
                         <div className="flex flex-wrap items-center gap-2 text-sm w-full md:w-auto">
                             <span className="text-slate-500 dark:text-slate-400 mr-2 font-medium">Config:</span>
                             <button onClick={handleResetSettings} className="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 transition font-medium">Reset</button>
@@ -1079,12 +1198,10 @@ const App: React.FC = () => {
                         </div>
                     </div>
 
-                    {/* DATA VIEWPORT COMPONENT */}
+                    {/* DATA VIEWPORT */}
                     {dataSets.length === 0 && !loadingState.active ? (
-                        <div
-                            onClick={handleTriggerFileInput}
-                            className="flex-1 flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl bg-slate-50/50 dark:bg-slate-900/50 cursor-pointer group hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50/20 dark:hover:bg-blue-950/10 transition-all duration-200"
-                        >
+                        <div onClick={handleTriggerFileInput}
+                             className="flex-1 flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl bg-slate-50/50 dark:bg-slate-900/50 cursor-pointer group hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50/20 dark:hover:bg-blue-950/10 transition-all duration-200">
                             <svg className="w-16 h-16 mb-4 opacity-50 group-hover:opacity-80 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-all duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
                             </svg>
@@ -1094,42 +1211,37 @@ const App: React.FC = () => {
                     ) : dataSets.length > 0 ? (
                         <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
 
-                            {/* TABS (Rendered only if Merge mode is disabled) */}
+                            {/* TABS */}
                             {!settings.mergeFiles && (
                                 <div className="flex overflow-x-auto border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 px-2 py-2 gap-2 hide-scrollbar shrink-0">
                                     {dataSets.map((dataset, idx) => (
-                                        <button
-                                            key={idx}
-                                            onClick={() => setActiveTab(idx)}
-                                            className={`px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-colors ${
-                                                activeTab === idx
-                                                    ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700'
-                                                    : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50'
-                                            }`}
-                                        >
+                                        <button key={idx} onClick={() => setActiveTab(idx)}
+                                                className={`px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-colors ${
+                                                    activeTab === idx
+                                                        ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700'
+                                                        : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50'
+                                                }`}>
                                             {dataset.fileName}
                                         </button>
                                     ))}
                                 </div>
                             )}
 
-                            {/* ISOLATED VIEWPORT SCROLL CONTAINER */}
+                            {/* SCROLL CONTAINER */}
                             <div className="flex-1 overflow-auto table-container relative min-h-0">
 
                                 {settings.mergeFiles ? (
-                                    /* =========================================================================
-                                       MERGE WORKSPACE: Multi-file contiguous scrolling layout (Flexbox/Grid hybrid)
-                                       ========================================================================= */
+                                    /* === MERGE VIEW === */
                                     <div className="space-y-12 bg-slate-50/30 dark:bg-slate-900/10 w-max min-w-full">
                                         {dataSets.map((dataset, fileIdx) => {
                                             const { headers, rows } = getFileHeadersAndRows(dataset.data);
+                                            const dataRows = settings.firstRowIsHeader ? dataset.data.slice(1) : dataset.data;
+                                            const sortedRows = applySortToRows(rows, dataRows);
+
                                             return (
                                                 <div key={fileIdx} className="relative border-b border-slate-200 dark:border-slate-800 last:border-none bg-white dark:bg-slate-950 flex flex-col w-full">
 
-                                                    {/* Sticky Header Wrapper Context - Houses name and tags without physical DOM breaks */}
                                                     <div className={`${settings.stickyHeaders ? 'sticky top-0 z-30' : ''} bg-white dark:bg-slate-950 flex flex-col -mb-px`}>
-
-                                                        {/* File Name Header Block - Dual-axis sticky layout constraint */}
                                                         <div className="bg-blue-50 dark:bg-blue-950 border-b border-blue-200 dark:border-blue-900/50 select-none py-1.5 h-8 w-max min-w-full relative">
                                                             <span className="sticky left-0 px-4 text-xs font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950 z-10 py-1">
                                                                 FILE [{fileIdx + 1}/{dataSets.length}]: {dataset.fileName}
@@ -1139,60 +1251,48 @@ const App: React.FC = () => {
                                                             </span>
                                                         </div>
 
-                                                        {/* Data Column Headers Row Container */}
                                                         <div className="flex bg-slate-100 dark:bg-slate-800 border-b border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-sm font-semibold pt-[9px]">
                                                             {headers.map((header, i) => (
-                                                                <div
-                                                                    key={i}
-                                                                    className={`px-4 py-2 shrink-0 flex items-center justify-between gap-4 w-[180px] bg-slate-100 dark:bg-slate-800
-                                                                        ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 z-35 border-r border-slate-300 dark:border-slate-700 font-bold' : ''}`
-                                                                    }
-                                                                >
-                                                                    {editingHeaderKey === `${fileIdx}-${i}` ? (
-                                                                        <InlineHeaderEditor
-                                                                            value={editHeaderValue}
-                                                                            onChange={setEditHeaderValue}
-                                                                            onSave={() => saveHeaderName(i)}
-                                                                            onCancel={cancelEditingHeader}
-                                                                            isMergeView={true}
-                                                                        />
-                                                                    ) : (
-                                                                        <div className="flex items-center justify-between gap-2 w-full group/header">
-                                                                            <span>{header}</span>
-                                                                            <button
-                                                                                onClick={() => startEditingHeader(fileIdx, i, header)}
-                                                                                className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-0.5"
-                                                                                title="Rename Column Globally"
-                                                                            >
-                                                                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
-                                                                            </button>
-                                                                        </div>
-                                                                    )}
+                                                                <div key={i}
+                                                                     className={`px-4 py-2 shrink-0 flex items-center justify-between gap-1 w-[180px] bg-slate-100 dark:bg-slate-800
+                                                                        ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 z-35 border-r border-slate-300 dark:border-slate-700 font-bold' : ''}`}>
+                                                                    <ColumnHeader
+                                                                        header={header}
+                                                                        colIndex={i}
+                                                                        fileIndex={fileIdx}
+                                                                        sortState={sortState}
+                                                                        colType={getColumnType(i, dataRows)}
+                                                                        isEditing={editingHeaderKey === `${fileIdx}-${i}`}
+                                                                        editValue={editHeaderValue}
+                                                                        onEditChange={setEditHeaderValue}
+                                                                        onEditStart={() => startEditingHeader(fileIdx, i, header)}
+                                                                        onEditSave={() => saveHeaderName(i)}
+                                                                        onEditCancel={cancelEditingHeader}
+                                                                        onSort={handleSort}
+                                                                        onTypeChange={handleTypeChange}
+                                                                        isMergeView={true}
+                                                                    />
                                                                 </div>
                                                             ))}
                                                         </div>
                                                     </div>
 
-                                                    {/* Text Rows Matrix Body Layer */}
                                                     <div className="divide-y divide-slate-200 dark:divide-slate-800 flex flex-col text-sm">
-                                                        {rows.map((row, rowIndex) => (
+                                                        {sortedRows.map((row, rowIndex) => (
                                                             <div key={rowIndex} className="flex hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
                                                                 {headers.map((_, colIndex) => {
                                                                     const cellValue = row[colIndex] || '';
                                                                     return (
-                                                                        <div
-                                                                            key={colIndex}
-                                                                            className={`px-4 py-2 shrink-0 w-[180px] text-slate-800 dark:text-slate-300 truncate
-                                                                                ${settings.firstColIsHeader && colIndex === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800 shadow-2xs' : ''}`
-                                                                            }
-                                                                        >
+                                                                        <div key={colIndex}
+                                                                             className={`px-4 py-2 shrink-0 w-[180px] text-slate-800 dark:text-slate-300 truncate
+                                                                                ${settings.firstColIsHeader && colIndex === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800 shadow-2xs' : ''}`}>
                                                                             {cellValue}
                                                                         </div>
                                                                     );
                                                                 })}
                                                             </div>
                                                         ))}
-                                                        {rows.length === 0 && (
+                                                        {sortedRows.length === 0 && (
                                                             <div className="px-4 py-8 text-center text-slate-500 w-full">
                                                                 No data rows successfully parsed within this file block.
                                                             </div>
@@ -1203,41 +1303,32 @@ const App: React.FC = () => {
                                         })}
                                     </div>
                                 ) : (
-                                    /* =========================================================================
-                                       TAB VIEW: Classic single sheet isolated structure
-                                       ========================================================================= */
+                                    /* === TAB VIEW === */
                                     <table className="w-full text-left border-collapse text-sm whitespace-nowrap">
                                         <thead>
                                         <tr className="text-slate-700 dark:text-slate-300">
                                             {isolatedTable.headers.map((header, i) => (
-                                                <th
-                                                    key={i}
+                                                <th key={i}
                                                     className={`px-4 py-2 border-b border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 relative
                                                         outline-1 outline-slate-100 dark:outline-slate-800
                                                         ${settings.stickyHeaders ? 'sticky top-0 z-20' : ''}
                                                         ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 border-r border-slate-300 dark:border-slate-700' : ''}
-                                                        ${settings.stickyHeaders && settings.firstColIsHeader && i === 0 ? 'z-30' : ''}`
-                                                    }
-                                                >
-                                                    {editingHeaderKey === `${activeTab}-${i}` ? (
-                                                        <InlineHeaderEditor
-                                                            value={editHeaderValue}
-                                                            onChange={setEditHeaderValue}
-                                                            onSave={() => saveHeaderName(i)}
-                                                            onCancel={cancelEditingHeader}
-                                                        />
-                                                    ) : (
-                                                        <div className="flex items-center justify-between gap-4 group/header">
-                                                            <span className="font-semibold">{header}</span>
-                                                            <button
-                                                                onClick={() => startEditingHeader(activeTab, i, header)}
-                                                                className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-1"
-                                                                title="Rename Column"
-                                                            >
-                                                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
-                                                            </button>
-                                                        </div>
-                                                    )}
+                                                        ${settings.stickyHeaders && settings.firstColIsHeader && i === 0 ? 'z-30' : ''}`}>
+                                                    <ColumnHeader
+                                                        header={header}
+                                                        colIndex={i}
+                                                        fileIndex={activeTab}
+                                                        sortState={sortState}
+                                                        colType={activeColumnTypes[i] || 'string'}
+                                                        isEditing={editingHeaderKey === `${activeTab}-${i}`}
+                                                        editValue={editHeaderValue}
+                                                        onEditChange={setEditHeaderValue}
+                                                        onEditStart={() => startEditingHeader(activeTab, i, header)}
+                                                        onEditSave={() => saveHeaderName(i)}
+                                                        onEditCancel={cancelEditingHeader}
+                                                        onSort={handleSort}
+                                                        onTypeChange={handleTypeChange}
+                                                    />
                                                 </th>
                                             ))}
                                         </tr>
@@ -1248,12 +1339,9 @@ const App: React.FC = () => {
                                                 {isolatedTable.headers.map((_, colIndex) => {
                                                     const cellValue = row[colIndex] || '';
                                                     return (
-                                                        <td
-                                                            key={colIndex}
+                                                        <td key={colIndex}
                                                             className={`px-4 py-2 text-slate-800 dark:text-slate-300
-                                                                ${settings.firstColIsHeader && colIndex === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800' : ''}`
-                                                            }
-                                                        >
+                                                                ${settings.firstColIsHeader && colIndex === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800' : ''}`}>
                                                             {cellValue}
                                                         </td>
                                                     );
@@ -1273,7 +1361,6 @@ const App: React.FC = () => {
                             </div>
                         </div>
                     ) : (
-                        /* Loading-but-no-data-yet placeholder — keeps layout stable during first import */
                         <div className="flex-1 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950" />
                     )}
                 </main>
