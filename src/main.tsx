@@ -43,6 +43,14 @@
  * - Custom names are stored inside `settings.columnCustomNames` mapped by index.
  * - Works universally: if a file has no header row, user-defined names are preserved
  *   and injected seamlessly across file reloads.
+ * - Inline edit widget provides three interaction paths:
+ *     a) SAVE: Enter key OR click ✓ button → commits `editHeaderValue` to `columnCustomNames`.
+ *     b) CANCEL: Escape key OR click ✗ button → discards changes, reverts to previous name.
+ *     c) BLUR: When input loses focus (e.g. clicking elsewhere), the system checks a
+ *        `cancelledRef` flag. If cancel was explicitly triggered (via Escape or ✗ button),
+ *        blur is suppressed (no save). Otherwise blur performs save (desktop convenience).
+ *   - The ✓ and ✗ buttons use `onMouseDown` with `e.preventDefault()` to prevent them from
+ *     stealing focus from the input and triggering a premature blur event.
  *
  * 4. [Multi-File Merging & Flex/Grid Cross-Axis Sticky Layout Engine]
  * - Toggleable `mergeFiles` strategy inside app settings layout.
@@ -96,7 +104,7 @@
  * ============================================================================
  */
 
-// @ts-ignore
+// @ts:ignore
 import React, { useState, useEffect, useRef, useMemo, useCallback, ChangeEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 
@@ -507,6 +515,136 @@ const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
 };
 
 
+// --- INLINE HEADER EDIT WIDGET COMPONENT ---
+
+/**
+ * Self-contained inline editing widget for column headers.
+ *
+ * Interaction model:
+ * - SAVE pathways:
+ *     1. Press `Enter` key while input is focused
+ *     2. Click the ✓ (checkmark) button
+ *     3. Click away from the widget (blur) — UNLESS cancel was explicitly triggered
+ * - CANCEL pathways:
+ *     1. Press `Escape` key while input is focused
+ *     2. Click the ✗ (cross) button
+ *
+ * Focus-stealing prevention:
+ * - The ✓ and ✗ buttons use `onMouseDown` with `e.preventDefault()` to prevent
+ *   them from stealing focus from the input, which would trigger a premature
+ *   `onBlur` before the button's `onClick` fires. This is critical because the
+ *   browser's event order is: mousedown → blur → mouseup → click. Without
+ *   preventDefault on mousedown, the blur handler would fire and potentially save
+ *   before the cancel click is registered.
+ *
+ * Cancel flag (`cancelledRef`):
+ * - A `useRef<boolean>` acts as a synchronous flag that survives across the
+ *   blur → click event boundary. When Escape or ✗ is pressed, `cancelledRef.current`
+ *   is set to `true` BEFORE blur fires, so `handleBlur` knows to skip saving.
+ *
+ * Props:
+ * - `value`: Current edit buffer value (controlled by parent).
+ * - `onChange`: Callback when the input text changes.
+ * - `onSave`: Callback to persist the current value.
+ * - `onCancel`: Callback to discard changes and exit edit mode.
+ * - `isMergeView`: Whether the widget is inside the merge layout (affects sizing).
+ */
+const InlineHeaderEditor: React.FC<{
+    value: string;
+    onChange: (val: string) => void;
+    onSave: () => void;
+    onCancel: () => void;
+    isMergeView?: boolean;
+}> = ({ value, onChange, onSave, onCancel, isMergeView = false }) => {
+    /**
+     * Synchronous cancel flag — set to `true` before blur fires when cancel
+     * is explicitly triggered (Escape key or ✗ button). Checked by `handleBlur`
+     * to decide whether to save or discard.
+     */
+    const cancelledRef = useRef(false);
+
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === 'Enter') {
+            onSave();
+        } else if (e.key === 'Escape') {
+            // Set flag BEFORE blur fires (blur is synchronous after Escape in some browsers)
+            cancelledRef.current = true;
+            onCancel();
+        }
+    };
+
+    const handleBlur = () => {
+        // If cancel was explicitly triggered, don't save — just bail
+        if (cancelledRef.current) {
+            cancelledRef.current = false;
+            return;
+        }
+        onSave();
+    };
+
+    /**
+     * Cancel button mousedown handler.
+     * - `e.preventDefault()` prevents this button from stealing focus from the input,
+     *   which would cause a blur event BEFORE onClick fires.
+     * - Sets `cancelledRef.current = true` so if blur still somehow fires, it won't save.
+     */
+    const handleCancelMouseDown = (e: React.MouseEvent) => {
+        e.preventDefault(); // Prevent focus steal → premature blur
+        cancelledRef.current = true;
+    };
+
+    /**
+     * Save button mousedown handler.
+     * - `e.preventDefault()` prevents focus steal from the input.
+     */
+    const handleSaveMouseDown = (e: React.MouseEvent) => {
+        e.preventDefault(); // Prevent focus steal → premature blur
+    };
+
+    return (
+        <div className="flex items-center gap-1 w-full">
+            <input
+                type="text"
+                value={value}
+                onChange={(e) => onChange(e.target.value)}
+                onBlur={handleBlur}
+                onKeyDown={handleKeyDown}
+                className={`bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 
+                    px-2 rounded border border-blue-500 focus:outline-none text-xs font-normal 
+                    flex-1 min-w-0 ${isMergeView ? 'py-0.5' : 'py-1'}`}
+                autoFocus
+            />
+            {/* ✓ Save button — accessible on touch devices */}
+            <button
+                onMouseDown={handleSaveMouseDown}
+                onClick={onSave}
+                className="shrink-0 p-0.5 rounded text-green-600 dark:text-green-400
+                    hover:bg-green-100 dark:hover:bg-green-900/40 transition-colors"
+                title="Save (Enter)"
+                aria-label="Save column name"
+            >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                </svg>
+            </button>
+            {/* ✗ Cancel button — accessible on touch devices */}
+            <button
+                onMouseDown={handleCancelMouseDown}
+                onClick={onCancel}
+                className="shrink-0 p-0.5 rounded text-red-500 dark:text-red-400
+                    hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
+                title="Cancel (Esc)"
+                aria-label="Cancel editing"
+            >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+        </div>
+    );
+};
+
+
 // --- MAIN APPLICATION COMPONENT ---
 const App: React.FC = () => {
     // --- STATE WITH SYNCHRONOUS LOCALSTORAGE INITIALIZATION ---
@@ -804,6 +942,10 @@ const App: React.FC = () => {
         setEditHeaderValue(currentValue);
     };
 
+    /**
+     * Saves the current edit buffer value into `settings.columnCustomNames`
+     * for the given column index, then exits edit mode.
+     */
     const saveHeaderName = (colIndex: number) => {
         if (editHeaderValue.trim() !== '') {
             setSettings(prev => ({
@@ -815,6 +957,15 @@ const App: React.FC = () => {
             }));
         }
         setEditingHeaderKey(null);
+    };
+
+    /**
+     * Cancels the current inline header edit without saving.
+     * Simply exits edit mode, discarding `editHeaderValue`.
+     */
+    const cancelEditingHeader = () => {
+        setEditingHeaderKey(null);
+        setEditHeaderValue('');
     };
 
     // --- DATA TRANSFORMATION SUB-ROUTINE ---
@@ -998,17 +1149,13 @@ const App: React.FC = () => {
                                                                     }
                                                                 >
                                                                     {editingHeaderKey === `${fileIdx}-${i}` ? (
-                                                                        <div className="flex items-center gap-1 w-full">
-                                                                            <input
-                                                                                type="text"
-                                                                                value={editHeaderValue}
-                                                                                onChange={(e) => setEditHeaderValue(e.target.value)}
-                                                                                onBlur={() => saveHeaderName(i)}
-                                                                                onKeyDown={(e) => e.key === 'Enter' && saveHeaderName(i)}
-                                                                                className="bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 px-2 py-0.5 rounded border border-blue-500 focus:outline-none text-xs font-normal w-full"
-                                                                                autoFocus
-                                                                            />
-                                                                        </div>
+                                                                        <InlineHeaderEditor
+                                                                            value={editHeaderValue}
+                                                                            onChange={setEditHeaderValue}
+                                                                            onSave={() => saveHeaderName(i)}
+                                                                            onCancel={cancelEditingHeader}
+                                                                            isMergeView={true}
+                                                                        />
                                                                     ) : (
                                                                         <div className="flex items-center justify-between gap-2 w-full group/header">
                                                                             <span>{header}</span>
@@ -1073,17 +1220,12 @@ const App: React.FC = () => {
                                                     }
                                                 >
                                                     {editingHeaderKey === `${activeTab}-${i}` ? (
-                                                        <div className="flex items-center gap-1">
-                                                            <input
-                                                                type="text"
-                                                                value={editHeaderValue}
-                                                                onChange={(e) => setEditHeaderValue(e.target.value)}
-                                                                onBlur={() => saveHeaderName(i)}
-                                                                onKeyDown={(e) => e.key === 'Enter' && saveHeaderName(i)}
-                                                                className="bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 px-2 py-1 rounded border border-blue-500 focus:outline-none text-xs font-normal"
-                                                                autoFocus
-                                                            />
-                                                        </div>
+                                                        <InlineHeaderEditor
+                                                            value={editHeaderValue}
+                                                            onChange={setEditHeaderValue}
+                                                            onSave={() => saveHeaderName(i)}
+                                                            onCancel={cancelEditingHeader}
+                                                        />
                                                     ) : (
                                                         <div className="flex items-center justify-between gap-4 group/header">
                                                             <span className="font-semibold">{header}</span>
