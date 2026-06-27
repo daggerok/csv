@@ -102,28 +102,19 @@
  *     Quoted tokens: "multi word" or 'multi word' = treated as single token.
  *     Negation: !token or !"multi word" = must NOT contain.
  *     All matching is case-insensitive substring (contains).
- *     Example: `ab "cd e"` → row must contain "ab" AND "cd e"
- *     Example: `ab, cd` → row must contain "ab" OR "cd"
- *     Example: `!ab !"cd e"` → row must NOT contain "ab" AND must NOT contain "cd e"
- *     Example: `ab !cd, ef` → (contains "ab" AND NOT "cd") OR (contains "ef")
  *
  *   NUMERIC MODE (type = number | percent | currency):
  *     Operators: =, !=, >, >=, <, <=
  *     Bare number = equals: `22` means `=22`
  *     Negation shorthand: `!22` means `!=22`
  *     Space = AND, Comma = OR (same as string mode).
- *     Example: `>10 <50` → value > 10 AND value < 50
- *     Example: `!3 !5` → value != 3 AND value != 5
- *     Example: `>100, <-5` → value > 100 OR value < -5
- *     Example: `>=10 <=20, 50` → (10..20 inclusive) OR exactly 50
  *
- *   When a numeric column is overridden to 'string' type, the filter switches
- *   to string mode automatically, so `!3, !5` would filter by substring rules.
- *
- * - Parsed into `FilterExpression` AST: array of OR-groups, each an array of
- *   AND-conditions. Each condition has: { value, operator, negated }.
- * - `matchesFilter` evaluates a cell value against a `FilterExpression`.
- * - `applyFilters` applies all active column filters to a row set.
+ * - Filter input is DEBOUNCED via `FILTER_DEBOUNCE_MS` constant.
+ *   The `ColumnFilterInput` component maintains its own local input state
+ *   for instant visual feedback, then debounces the actual filter application
+ *   to the parent via a `setTimeout` timer stored in a `useRef`. This prevents
+ *   expensive re-filtering on every keystroke while keeping the input responsive.
+ *   Clearing the filter (via ✗ button) bypasses the debounce and applies immediately.
  *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
@@ -155,7 +146,6 @@ const COLUMN_TYPE_COLORS: Record<ColumnType, string> = {
     marketcap: 'bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300',
 };
 
-/** Column types that use numeric filter operators (=, !=, >, <, >=, <=) */
 const NUMERIC_FILTER_TYPES: Set<ColumnType> = new Set(['number', 'percent', 'currency']);
 
 interface AppSettings {
@@ -169,7 +159,6 @@ interface AppSettings {
 }
 
 interface DataSet { fileName: string; data: string[][]; }
-
 interface SortState { columnIndex: number | null; direction: 'asc' | 'desc'; }
 
 interface LoadingState {
@@ -195,10 +184,11 @@ interface NumericFilterCondition {
 }
 
 type FilterCondition = StringFilterCondition | NumericFilterCondition;
+interface FilterExpression { orGroups: FilterCondition[][]; }
 
-interface FilterExpression {
-    orGroups: FilterCondition[][];
-}
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 
 const DEFAULT_SETTINGS: AppSettings = {
     theme: 'light',
@@ -216,6 +206,15 @@ const EXPENSIVE_TOGGLE_ROW_THRESHOLD = 500;
 const TYPE_DETECTION_SAMPLE_SIZE = 20;
 const LAYOUT_RESTRUCTURING_KEYS: Set<keyof AppSettings> = new Set(['mergeFiles', 'firstRowIsHeader', 'firstColIsHeader']);
 const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+/**
+ * Debounce delay in milliseconds for filter input.
+ * Controls how long after the user stops typing before the filter is applied.
+ * Lower values = more responsive but more CPU work on large datasets.
+ * Higher values = less CPU churn but noticeable delay before results update.
+ * Recommended range: 150–400ms. Default: 250ms.
+ */
+const FILTER_DEBOUNCE_MS = 250;
 
 // ============================================================================
 // CSV PARSING
@@ -335,11 +334,6 @@ function getComparator(colIndex: number, direction: 'asc' | 'desc', colType: Col
 // FILTER ENGINE
 // ============================================================================
 
-/**
- * Tokenizes a filter input string into raw tokens, respecting quoted strings.
- * Commas are preserved as "," separator tokens. Spaces split unquoted tokens.
- * Negation (!) before quotes is preserved: !"multi word" → "!multi word"
- */
 function tokenizeFilterInput(input: string): string[] {
     const tokens: string[] = [];
     let i = 0;
@@ -351,40 +345,26 @@ function tokenizeFilterInput(input: string): string[] {
 
         let token = '';
 
-        // Check for negation prefix before a quote
         if (input[i] === '!' && i + 1 < len) {
             if (input[i + 1] === '"' || input[i + 1] === "'") {
-                token = '!';
-                i++;
-                // Fall through to quote handling below
+                token = '!'; i++;
             } else {
-                token = '!';
-                i++;
-                while (i < len && input[i] !== ' ' && input[i] !== '\t' && input[i] !== ',') {
-                    token += input[i]; i++;
-                }
-                tokens.push(token);
-                continue;
+                token = '!'; i++;
+                while (i < len && input[i] !== ' ' && input[i] !== '\t' && input[i] !== ',') { token += input[i]; i++; }
+                tokens.push(token); continue;
             }
         }
 
-        // Quoted string
         if (input[i] === '"' || input[i] === "'") {
-            const quote = input[i];
-            i++; // skip opening quote
+            const quote = input[i]; i++;
             while (i < len && input[i] !== quote) { token += input[i]; i++; }
-            if (i < len) i++; // skip closing quote
-            tokens.push(token);
-            continue;
+            if (i < len) i++;
+            tokens.push(token); continue;
         }
 
-        // Regular unquoted token
-        while (i < len && input[i] !== ' ' && input[i] !== '\t' && input[i] !== ',') {
-            token += input[i]; i++;
-        }
+        while (i < len && input[i] !== ' ' && input[i] !== '\t' && input[i] !== ',') { token += input[i]; i++; }
         if (token) tokens.push(token);
     }
-
     return tokens;
 }
 
@@ -399,126 +379,65 @@ const NUMERIC_TOKEN_REGEX = /^(!?)(>=|<=|!=|>|<|=)?(-?[\d,.]+)$/;
 function parseNumericToken(token: string): NumericFilterCondition | null {
     const match = token.match(NUMERIC_TOKEN_REGEX);
     if (!match) return null;
-
     const [, negPrefix, operatorStr, numStr] = match;
     const value = parseFloat(numStr.replace(/,/g, ''));
     if (isNaN(value)) return null;
-
     let operator: NumericFilterCondition['operator'];
-
     if (operatorStr) {
         if (negPrefix === '!') {
-            const inversions: Record<string, NumericFilterCondition['operator']> = {
-                '>': '<=', '>=': '<', '<': '>=', '<=': '>', '=': '!=', '!=': '='
-            };
+            const inversions: Record<string, NumericFilterCondition['operator']> = { '>': '<=', '>=': '<', '<': '>=', '<=': '>', '=': '!=', '!=': '=' };
             operator = inversions[operatorStr] || '=';
-        } else {
-            operator = operatorStr as NumericFilterCondition['operator'];
-        }
-    } else {
-        operator = negPrefix === '!' ? '!=' : '=';
-    }
-
+        } else { operator = operatorStr as NumericFilterCondition['operator']; }
+    } else { operator = negPrefix === '!' ? '!=' : '='; }
     return { type: 'numeric', value, operator };
 }
 
-/**
- * Parses a raw filter input string into a FilterExpression AST.
- * Returns null for empty/whitespace-only input.
- */
 function parseFilterExpression(input: string, colType: ColumnType): FilterExpression | null {
     const trimmed = input.trim();
     if (trimmed === '') return null;
-
     const tokens = tokenizeFilterInput(trimmed);
     if (tokens.length === 0) return null;
-
     const isNumericMode = NUMERIC_FILTER_TYPES.has(colType);
     const orGroups: FilterCondition[][] = [];
     let currentGroup: FilterCondition[] = [];
-
     for (const token of tokens) {
-        if (token === ',') {
-            if (currentGroup.length > 0) {
-                orGroups.push(currentGroup);
-                currentGroup = [];
-            }
-            continue;
-        }
-
-        if (isNumericMode) {
-            const numCondition = parseNumericToken(token);
-            if (numCondition) {
-                currentGroup.push(numCondition);
-            } else {
-                currentGroup.push(parseStringToken(token));
-            }
-        } else {
-            currentGroup.push(parseStringToken(token));
-        }
+        if (token === ',') { if (currentGroup.length > 0) { orGroups.push(currentGroup); currentGroup = []; } continue; }
+        if (isNumericMode) { const nc = parseNumericToken(token); if (nc) currentGroup.push(nc); else currentGroup.push(parseStringToken(token)); }
+        else { currentGroup.push(parseStringToken(token)); }
     }
-
     if (currentGroup.length > 0) orGroups.push(currentGroup);
     return orGroups.length > 0 ? { orGroups } : null;
 }
 
-/**
- * Evaluates whether a single cell value matches a FilterExpression.
- * OR-groups: at least ONE must fully match. AND within group: ALL must match.
- */
 function matchesFilter(cellValue: string, filter: FilterExpression, colType: ColumnType): boolean {
     const cellLower = cellValue.toLowerCase();
     const cellNumeric = NUMERIC_FILTER_TYPES.has(colType) ? extractNumericValue(cellValue, colType) : null;
-
-    return filter.orGroups.some(group => {
-        return group.every(condition => {
-            if (condition.type === 'string') {
-                const contains = cellLower.includes(condition.value);
-                return condition.negated ? !contains : contains;
+    return filter.orGroups.some(group => group.every(condition => {
+        if (condition.type === 'string') { const c = cellLower.includes(condition.value); return condition.negated ? !c : c; }
+        if (condition.type === 'numeric') {
+            if (cellNumeric === null) return condition.operator === '!=';
+            switch (condition.operator) {
+                case '=': return cellNumeric === condition.value;
+                case '!=': return cellNumeric !== condition.value;
+                case '>': return cellNumeric > condition.value;
+                case '>=': return cellNumeric >= condition.value;
+                case '<': return cellNumeric < condition.value;
+                case '<=': return cellNumeric <= condition.value;
+                default: return false;
             }
-
-            if (condition.type === 'numeric') {
-                if (cellNumeric === null) return condition.operator === '!=';
-                switch (condition.operator) {
-                    case '=':  return cellNumeric === condition.value;
-                    case '!=': return cellNumeric !== condition.value;
-                    case '>':  return cellNumeric > condition.value;
-                    case '>=': return cellNumeric >= condition.value;
-                    case '<':  return cellNumeric < condition.value;
-                    case '<=': return cellNumeric <= condition.value;
-                    default:   return false;
-                }
-            }
-            return false;
-        });
-    });
+        }
+        return false;
+    }));
 }
 
-/**
- * Applies all active column filters to a set of rows.
- * Pre-parses filter expressions, then filters rows where ALL column filters match.
- */
-function applyFilters(
-    rows: string[][],
-    filters: Record<number, string>,
-    getColType: (colIndex: number) => ColumnType,
-): string[][] {
-    const parsedFilters: { colIndex: number; expression: FilterExpression; colType: ColumnType }[] = [];
-
-    for (const [colIdxStr, filterStr] of Object.entries(filters)) {
-        const colIndex = parseInt(colIdxStr, 10);
-        const colType = getColType(colIndex);
-        const expression = parseFilterExpression(filterStr, colType);
-        if (expression) parsedFilters.push({ colIndex, expression, colType });
+function applyFilters(rows: string[][], filters: Record<number, string>, getColType: (colIndex: number) => ColumnType): string[][] {
+    const parsed: { colIndex: number; expression: FilterExpression; colType: ColumnType }[] = [];
+    for (const [s, f] of Object.entries(filters)) {
+        const ci = parseInt(s, 10); const ct = getColType(ci); const ex = parseFilterExpression(f, ct);
+        if (ex) parsed.push({ colIndex: ci, expression: ex, colType: ct });
     }
-
-    if (parsedFilters.length === 0) return rows;
-
-    return rows.filter(row =>
-        parsedFilters.every(({ colIndex, expression, colType }) =>
-            matchesFilter(row[colIndex] || '', expression, colType)
-        )
-    );
+    if (parsed.length === 0) return rows;
+    return rows.filter(row => parsed.every(({ colIndex, expression, colType }) => matchesFilter(row[colIndex] || '', expression, colType)));
 }
 
 // ============================================================================
@@ -600,12 +519,23 @@ const InlineHeaderEditor: React.FC<{
 };
 
 // ============================================================================
-// FILTER INPUT COMPONENT
+// FILTER INPUT COMPONENT (with debounce)
 // ============================================================================
 
 /**
  * Inline filter input rendered below each column header.
- * Shows a small text input that appears on hover or when a filter is active.
+ *
+ * Uses LOCAL state for the input value so typing is instant with zero lag,
+ * then DEBOUNCES the actual filter application to the parent component
+ * via `onFilterChange` after `FILTER_DEBOUNCE_MS` of inactivity.
+ *
+ * The debounce timer is stored in a `useRef` so it persists across renders
+ * and is properly cleaned up on unmount.
+ *
+ * Clearing the filter (✗ button) bypasses the debounce and fires immediately.
+ *
+ * The `filterValue` prop from the parent is used to sync when filters are
+ * cleared externally (e.g., "Clear All Filters" button or tab switch).
  */
 const ColumnFilterInput: React.FC<{
     colIndex: number;
@@ -613,7 +543,73 @@ const ColumnFilterInput: React.FC<{
     colType: ColumnType;
     onFilterChange: (colIndex: number, value: string) => void;
 }> = ({ colIndex, filterValue, colType, onFilterChange }) => {
-    const isActive = filterValue.trim() !== '';
+    /**
+     * Local input state — drives the <input> value for instant keystroke feedback.
+     * Initialized from the parent's `filterValue` prop.
+     */
+    const [localValue, setLocalValue] = useState(filterValue);
+
+    /**
+     * Ref to the debounce timer ID. Using a ref instead of state because
+     * we don't want clearing/setting the timer to trigger re-renders.
+     */
+    const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    /**
+     * Sync local state when parent clears filters externally.
+     * This covers: "Clear All Filters" button, tab switches, merge toggle.
+     * We only sync when the parent value diverges from local (external reset).
+     */
+    useEffect(() => {
+        setLocalValue(filterValue);
+    }, [filterValue]);
+
+    /**
+     * Cleanup the debounce timer on unmount to prevent stale callbacks.
+     */
+    useEffect(() => {
+        return () => {
+            if (debounceTimerRef.current !== null) {
+                clearTimeout(debounceTimerRef.current);
+            }
+        };
+    }, []);
+
+    /**
+     * Handles each keystroke: updates local state immediately,
+     * then schedules the debounced parent update.
+     */
+    const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const newValue = e.target.value;
+        setLocalValue(newValue);
+
+        // Clear any pending debounce timer
+        if (debounceTimerRef.current !== null) {
+            clearTimeout(debounceTimerRef.current);
+        }
+
+        // Schedule debounced filter application
+        debounceTimerRef.current = setTimeout(() => {
+            onFilterChange(colIndex, newValue);
+            debounceTimerRef.current = null;
+        }, FILTER_DEBOUNCE_MS);
+    };
+
+    /**
+     * Clear button handler — bypasses debounce for instant clearing.
+     * Clears both local state and parent filter immediately.
+     */
+    const handleClear = () => {
+        // Cancel any pending debounce
+        if (debounceTimerRef.current !== null) {
+            clearTimeout(debounceTimerRef.current);
+            debounceTimerRef.current = null;
+        }
+        setLocalValue('');
+        onFilterChange(colIndex, '');
+    };
+
+    const isActive = localValue.trim() !== '';
     const isNumeric = NUMERIC_FILTER_TYPES.has(colType);
     const placeholder = isNumeric ? '>10 <50, =22' : 'filter…';
 
@@ -625,15 +621,15 @@ const ColumnFilterInput: React.FC<{
             </svg>
             <input
                 type="text"
-                value={filterValue}
-                onChange={(e) => onFilterChange(colIndex, e.target.value)}
+                value={localValue}
+                onChange={handleInputChange}
                 placeholder={placeholder}
                 className={`w-full min-w-0 text-[10px] px-1 py-0.5 rounded font-normal bg-white dark:bg-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-500
                     ${isActive ? 'border border-blue-400 dark:border-blue-600 text-slate-800 dark:text-slate-200' : 'border border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-400'}`}
                 title={isNumeric ? 'Numeric filter: =, !=, >, >=, <, <=. Space=AND, Comma=OR. Example: >10 <50' : 'Text filter: space=AND, comma=OR, !=NOT, "quotes"=phrase. Example: ab "cd e", !xyz'}
             />
             {isActive && (
-                <button onClick={() => onFilterChange(colIndex, '')} className="shrink-0 p-0.5 rounded text-slate-400 hover:text-red-500 dark:hover:text-red-400 transition-colors" title="Clear filter">
+                <button onClick={handleClear} className="shrink-0 p-0.5 rounded text-slate-400 hover:text-red-500 dark:hover:text-red-400 transition-colors" title="Clear filter">
                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>
                 </button>
             )}
@@ -672,7 +668,6 @@ const ColumnHeader: React.FC<{
     return (
         <div className="flex flex-col w-full group/header">
             <div className="flex items-center justify-between gap-1 w-full">
-                {/* Sort triangles */}
                 <div className="flex flex-col shrink-0 -my-1 opacity-0 group-hover/header:opacity-100 transition-opacity">
                     <button onClick={() => onSort(colIndex, 'asc')} className={`p-0 leading-none transition-colors ${isAsc ? 'text-blue-600 dark:text-blue-400' : 'text-slate-300 dark:text-slate-600 hover:text-slate-500 dark:hover:text-slate-400'}`} title="Sort Ascending">
                         <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor"><path d="M6 2L10 8H2L6 2Z" /></svg>
@@ -681,22 +676,15 @@ const ColumnHeader: React.FC<{
                         <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor"><path d="M6 10L2 4H10L6 10Z" /></svg>
                     </button>
                 </div>
-
                 <span className={`truncate flex-1 ${isMergeView ? '' : 'font-semibold'}`}>{header}</span>
-
-                {/* Type badge */}
                 <button onClick={e => { e.stopPropagation(); const i = ALL_COLUMN_TYPES.indexOf(colType); onTypeChange(colIndex, ALL_COLUMN_TYPES[(i + 1) % ALL_COLUMN_TYPES.length]); }}
                         className={`shrink-0 px-1.5 py-0 rounded text-[9px] font-bold leading-4 tracking-wide transition-all cursor-pointer border border-transparent hover:border-slate-400 dark:hover:border-slate-500 ${isActiveSort ? 'opacity-100' : 'opacity-0 group-hover/header:opacity-70'} ${COLUMN_TYPE_COLORS[colType]}`}
                         title={`Column type: ${colType}. Click to cycle.`}>
                     {COLUMN_TYPE_LABELS[colType]}
                 </button>
-
-                {/* Edit button */}
                 <button onClick={onEditStart} className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-0.5 shrink-0" title="Rename Column">
                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
                 </button>
-
-                {/* Active sort indicator */}
                 {isActiveSort && (
                     <span className="shrink-0 text-blue-500 dark:text-blue-400">
                         {isAsc ? <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor"><path d="M6 2L10 8H2L6 2Z" /></svg>
@@ -704,8 +692,6 @@ const ColumnHeader: React.FC<{
                     </span>
                 )}
             </div>
-
-            {/* Filter input — below header name */}
             <ColumnFilterInput colIndex={colIndex} filterValue={filterValue} colType={colType} onFilterChange={onFilterChange} />
         </div>
     );
@@ -734,14 +720,12 @@ const App: React.FC = () => {
 
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    // --- Theme & cache sync ---
     useEffect(() => {
         localStorage.setItem('fidelityApp_settings', JSON.stringify(settings));
         if (settings.theme === 'dark') document.documentElement.classList.add('dark');
         else document.documentElement.classList.remove('dark');
     }, [settings]);
 
-    // --- Paint detection for rendering phase ---
     useEffect(() => {
         if (loadingState.phase !== 'rendering') return;
         let cancelled = false;
@@ -750,7 +734,6 @@ const App: React.FC = () => {
         return () => { cancelled = true; };
     }, [loadingState.phase]);
 
-    // --- Reset sort and filters on tab/merge change ---
     useEffect(() => {
         setSortState(DEFAULT_SORT_STATE);
         setColumnFilters({});
@@ -803,7 +786,6 @@ const App: React.FC = () => {
 
     const handleTriggerFileInput = () => fileInputRef.current?.click();
 
-    // --- File processing pipeline ---
     const processFilesAsync = useCallback(async (files: File[]) => {
         setLoadingState({ active: true, phase: 'parsing', current: 0, total: files.length, fileName: '' });
         await yieldToMain();
@@ -835,23 +817,19 @@ const App: React.FC = () => {
 
     const handleClearData = () => { setDataSets([]); setActiveTab(0); setSortState(DEFAULT_SORT_STATE); setColumnFilters({}); };
 
-    // --- Inline editing ---
     const startEditingHeader = (fileIndex: number, colIndex: number, currentValue: string) => { setEditingHeaderKey(`${fileIndex}-${colIndex}`); setEditHeaderValue(currentValue); };
     const saveHeaderName = (colIndex: number) => { if (editHeaderValue.trim() !== '') setSettings(prev => ({ ...prev, columnCustomNames: { ...prev.columnCustomNames, [colIndex]: editHeaderValue.trim() } })); setEditingHeaderKey(null); };
     const cancelEditingHeader = () => { setEditingHeaderKey(null); setEditHeaderValue(''); };
 
-    // --- Sort ---
     const handleSort = useCallback((colIndex: number, direction: 'asc' | 'desc') => {
         setSortState(prev => prev.columnIndex === colIndex && prev.direction === direction ? DEFAULT_SORT_STATE : { columnIndex: colIndex, direction });
     }, []);
 
-    // --- Type change ---
     const handleTypeChange = useCallback((colIndex: number, newType: ColumnType) => {
         setSettings(prev => ({ ...prev, columnTypeOverrides: { ...prev.columnTypeOverrides, [colIndex]: newType } }));
         setSortState(DEFAULT_SORT_STATE);
     }, []);
 
-    // --- Filter change ---
     const handleFilterChange = useCallback((colIndex: number, value: string) => {
         setColumnFilters(prev => {
             const next = { ...prev };
@@ -860,7 +838,6 @@ const App: React.FC = () => {
         });
     }, []);
 
-    // --- Data transformation ---
     const getFileHeadersAndRows = useCallback((fileRawRows: string[][]) => {
         if (fileRawRows.length === 0) return { headers: [] as string[], rows: [] as string[][] };
         const totalColumns = fileRawRows[0].length;
@@ -903,8 +880,6 @@ const App: React.FC = () => {
         <>
             <LoadingOverlay state={loadingState} />
             <div className="h-screen bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100 transition-colors duration-300 font-sans flex flex-col overflow-hidden">
-
-                {/* HEADER */}
                 <header className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-4 py-3 flex flex-col sm:flex-row justify-between items-center gap-4 z-40 shadow-xs shrink-0">
                     <div className="flex items-center gap-2">
                         <svg className="w-6 h-6 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
@@ -933,11 +908,9 @@ const App: React.FC = () => {
                     </div>
                 </header>
 
-                {/* MAIN */}
                 <main className="flex-1 flex flex-col p-4 gap-4 max-w-full overflow-hidden min-h-0 bg-slate-50 dark:bg-slate-900 transition-colors duration-300">
                     <input type="file" ref={fileInputRef} multiple accept=".csv" className="hidden" onChange={handleFileUpload} />
 
-                    {/* CONTROLS */}
                     <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-slate-950 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm shrink-0">
                         <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
                             <button onClick={handleTriggerFileInput} disabled={loadingState.active} className="cursor-pointer bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm">Import CSV Files</button>
@@ -949,14 +922,11 @@ const App: React.FC = () => {
                             <button onClick={handleExportSettings} className="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 transition font-medium">Export JSON</button>
                             <label className="cursor-pointer px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 transition font-medium">Import JSON<input type="file" accept=".json" className="hidden" onChange={handleImportSettings} /></label>
                             {hasActiveFilters && (
-                                <button onClick={() => setColumnFilters({})} className="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-medium text-xs">
-                                    Clear All Filters
-                                </button>
+                                <button onClick={() => setColumnFilters({})} className="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-medium text-xs">Clear All Filters</button>
                             )}
                         </div>
                     </div>
 
-                    {/* DATA VIEWPORT */}
                     {dataSets.length === 0 && !loadingState.active ? (
                         <div onClick={handleTriggerFileInput} className="flex-1 flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl bg-slate-50/50 dark:bg-slate-900/50 cursor-pointer group hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50/20 dark:hover:bg-blue-950/10 transition-all duration-200">
                             <svg className="w-16 h-16 mb-4 opacity-50 group-hover:opacity-80 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-all duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
@@ -965,19 +935,13 @@ const App: React.FC = () => {
                         </div>
                     ) : dataSets.length > 0 ? (
                         <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
-
-                            {/* TABS */}
                             {!settings.mergeFiles && (
                                 <div className="flex overflow-x-auto border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 px-2 py-2 gap-2 hide-scrollbar shrink-0">
                                     {dataSets.map((ds, idx) => (
-                                        <button key={idx} onClick={() => setActiveTab(idx)} className={`px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-colors ${activeTab === idx ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50'}`}>
-                                            {ds.fileName}
-                                        </button>
+                                        <button key={idx} onClick={() => setActiveTab(idx)} className={`px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-colors ${activeTab === idx ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50'}`}>{ds.fileName}</button>
                                     ))}
                                 </div>
                             )}
-
-                            {/* Filter status bar */}
                             {hasActiveFilters && !settings.mergeFiles && (
                                 <div className="flex items-center gap-2 px-4 py-1.5 bg-blue-50 dark:bg-blue-950/30 border-b border-blue-200 dark:border-blue-800/50 text-xs text-blue-700 dark:text-blue-400 shrink-0">
                                     <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" /></svg>
@@ -985,11 +949,8 @@ const App: React.FC = () => {
                                     <span className="text-blue-500 dark:text-blue-500">({isolatedTable.totalBeforeFilter - isolatedTable.rows.length} filtered out)</span>
                                 </div>
                             )}
-
-                            {/* SCROLL CONTAINER */}
                             <div className="flex-1 overflow-auto table-container relative min-h-0">
                                 {settings.mergeFiles ? (
-                                    /* === MERGE VIEW === */
                                     <div className="space-y-12 bg-slate-50/30 dark:bg-slate-900/10 w-max min-w-full">
                                         {dataSets.map((dataset, fileIdx) => {
                                             const { headers, rows } = getFileHeadersAndRows(dataset.data);
@@ -997,7 +958,6 @@ const App: React.FC = () => {
                                             const getColType = (i: number) => getColumnType(i, dataRows);
                                             const filtered = applyFilters(rows, columnFilters, getColType);
                                             const sorted = applySortToRows(filtered, dataRows);
-
                                             return (
                                                 <div key={fileIdx} className="relative border-b border-slate-200 dark:border-slate-800 last:border-none bg-white dark:bg-slate-950 flex flex-col w-full">
                                                     <div className={`${settings.stickyHeaders ? 'sticky top-0 z-30' : ''} bg-white dark:bg-slate-950 flex flex-col -mb-px`}>
@@ -1020,9 +980,7 @@ const App: React.FC = () => {
                                                         {sorted.map((row, ri) => (
                                                             <div key={ri} className="flex hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
                                                                 {headers.map((_, ci) => (
-                                                                    <div key={ci} className={`px-4 py-2 shrink-0 w-[180px] text-slate-800 dark:text-slate-300 truncate ${settings.firstColIsHeader && ci === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800 shadow-2xs' : ''}`}>
-                                                                        {row[ci] || ''}
-                                                                    </div>
+                                                                    <div key={ci} className={`px-4 py-2 shrink-0 w-[180px] text-slate-800 dark:text-slate-300 truncate ${settings.firstColIsHeader && ci === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800 shadow-2xs' : ''}`}>{row[ci] || ''}</div>
                                                                 ))}
                                                             </div>
                                                         ))}
@@ -1033,7 +991,6 @@ const App: React.FC = () => {
                                         })}
                                     </div>
                                 ) : (
-                                    /* === TAB VIEW === */
                                     <table className="w-full text-left border-collapse text-sm whitespace-nowrap">
                                         <thead>
                                         <tr className="text-slate-700 dark:text-slate-300">
@@ -1048,16 +1005,12 @@ const App: React.FC = () => {
                                         {isolatedTable.rows.map((row, ri) => (
                                             <tr key={ri} className="hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
                                                 {isolatedTable.headers.map((_, ci) => (
-                                                    <td key={ci} className={`px-4 py-2 text-slate-800 dark:text-slate-300 ${settings.firstColIsHeader && ci === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800' : ''}`}>
-                                                        {row[ci] || ''}
-                                                    </td>
+                                                    <td key={ci} className={`px-4 py-2 text-slate-800 dark:text-slate-300 ${settings.firstColIsHeader && ci === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800' : ''}`}>{row[ci] || ''}</td>
                                                 ))}
                                             </tr>
                                         ))}
                                         {isolatedTable.rows.length === 0 && (
-                                            <tr><td colSpan={isolatedTable.headers.length || 1} className="px-4 py-8 text-center text-slate-500">
-                                                {hasActiveFilters ? 'No rows match the current filters.' : 'No table data extracted.'}
-                                            </td></tr>
+                                            <tr><td colSpan={isolatedTable.headers.length || 1} className="px-4 py-8 text-center text-slate-500">{hasActiveFilters ? 'No rows match the current filters.' : 'No table data extracted.'}</td></tr>
                                         )}
                                         </tbody>
                                     </table>
@@ -1079,11 +1032,7 @@ const App: React.FC = () => {
 
 const rootElement = document.getElementById('root');
 if (rootElement) {
-    createRoot(rootElement).render(
-        <React.StrictMode>
-            <App />
-        </React.StrictMode>
-    );
+    createRoot(rootElement).render(<React.StrictMode><App /></React.StrictMode>);
 } else {
     console.error("Failed to find root element.");
 }
