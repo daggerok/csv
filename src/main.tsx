@@ -1,3 +1,4 @@
+// main.tsx
 /**
  * ============================================================================
  * AGENTIC AI ENFORCED SPECIFICATION & GUIDELINES (CRITICAL)
@@ -22,7 +23,7 @@
  * 1. [Types & State Management]
  * - `AppSettings`: Stores UI/UX settings (theme, header configurations,
  * multi-file merge state, custom column name mappings, column type overrides,
- * and structural sticky flags).
+ * rememberData flag, and structural sticky flags).
  * - `DataSet`: Represents a parsed CSV file with cleaned table rows.
  * - `SortState`: Tracks current sort column index and direction (asc/desc/null).
  * - Settings are initialized SYNCHRONOUSLY from `localStorage` to prevent
@@ -116,6 +117,45 @@
  *   expensive re-filtering on every keystroke while keeping the input responsive.
  *   Clearing the filter (via ✗ button) bypasses the debounce and applies immediately.
  *
+ * 10. [Remember Data — LocalStorage Persistence for Imported Datasets]
+ * - Toggleable via `settings.rememberData` checkbox in the header settings bar.
+ * - When ENABLED:
+ *     a) On every `dataSets` change, the current datasets are serialized to JSON
+ *        and written to `localStorage` under key `LOCALSTORAGE_DATA_KEY`.
+ *     b) On app boot, if `rememberData` is true AND stored data exists, datasets
+ *        are restored ASYNCHRONOUSLY after the first React paint. The spinner
+ *        is shown first, then data is parsed off the critical path, preventing
+ *        any main-thread blocking or frozen-page experience.
+ *     c) A size guard (`LOCALSTORAGE_MAX_DATA_MB`) prevents writes that would
+ *        exceed the browser's localStorage quota. If the serialized data exceeds
+ *        this limit, the write is skipped and a console warning is emitted.
+ *        The setting remains enabled so smaller future imports will still persist.
+ * - When DISABLED:
+ *     a) Stored data under `LOCALSTORAGE_DATA_KEY` is immediately deleted.
+ *     b) No persistence occurs on subsequent `dataSets` changes.
+ * - When toggling FROM disabled TO enabled: current in-memory datasets are
+ *   immediately persisted (if within size limit).
+ * - The `Clear Data` button also removes persisted data from localStorage.
+ *
+ * 11. [Async Boot Restore Pipeline — StrictMode-Safe Design]
+ * - The restore flow is intentionally self-contained: it does NOT rely on the
+ *   separate `'rendering'` phase useEffect for dismissal, because that effect
+ *   is triggered by a state change and is subject to StrictMode double-invocation
+ *   cancellation races.
+ * - `isRestoringRef` is set to `true` SYNCHRONOUSLY during `useRef` initialization
+ *   (not inside the async callback) when boot-restore is needed. This prevents
+ *   the dataSets persistence useEffect from firing before the restore effect's
+ *   first `await` and deleting the localStorage data it needs to read.
+ * - Uses a monotonic `restoreRunIdRef` counter for StrictMode safety: each effect
+ *   invocation gets a unique ID; stale runs self-abort at every async checkpoint.
+ *
+ * 12. [Debug Mode]
+ * - Activated via `?debug=true` URL query parameter.
+ * - Enables verbose console logging throughout the boot-restore pipeline,
+ *   yieldToMain, and waitForPaint utility functions.
+ * - All debug logs are prefixed with `[DBG]` for easy filtering.
+ * - When `?debug=true` is not present, all debug logging is completely inert (no-op).
+ *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
  * - Custom SVGs inline to avoid dependency bloat.
@@ -125,6 +165,32 @@
 // @ts-ignore
 import React, { useState, useEffect, useRef, useMemo, useCallback, ChangeEvent } from 'react';
 import { createRoot } from 'react-dom/client';
+
+// ============================================================================
+// DEBUG SYSTEM
+// ============================================================================
+
+/**
+ * Debug mode is controlled by the `?debug=true` URL parameter.
+ * When active, verbose logs are emitted for boot-restore, paint waiting, etc.
+ * When inactive, `dbg()` is a no-op with zero runtime cost.
+ */
+const DEBUG_ENABLED: boolean = (() => {
+    try {
+        return new URLSearchParams(window.location.search).get('debug') === 'true';
+    } catch { return false; }
+})();
+
+/** Conditional debug logger — no-op unless `?debug=true` is in the URL */
+function dbg(...args: unknown[]): void {
+    if (DEBUG_ENABLED) console.log('[DBG]', ...args);
+}
+
+if (DEBUG_ENABLED) {
+    console.log('%c[DEBUG MODE ACTIVE]%c Add ?debug=true to URL to enable. Remove to disable.',
+        'color: #fff; background: #e11d48; padding: 2px 6px; border-radius: 3px; font-weight: bold;',
+        'color: #6b7280;');
+}
 
 // ============================================================================
 // TYPES
@@ -154,6 +220,7 @@ interface AppSettings {
     firstColIsHeader: boolean;
     mergeFiles: boolean;
     stickyHeaders: boolean;
+    rememberData: boolean; // Persist imported datasets to localStorage across reloads
     columnCustomNames: Record<number, string>;
     columnTypeOverrides: Record<number, ColumnType>;
 }
@@ -163,7 +230,16 @@ interface SortState { columnIndex: number | null; direction: 'asc' | 'desc'; }
 
 interface LoadingState {
     active: boolean;
-    phase: 'idle' | 'parsing' | 'rendering';
+    /**
+     * Phase values:
+     * - 'idle'      : No loading in progress.
+     * - 'parsing'   : Reading and parsing CSV files from disk.
+     * - 'rendering' : Data committed to state; waiting for browser paint before dismissing spinner.
+     * - 'restoring' : Boot-time async restore from localStorage. The boot-restore useEffect
+     *                 owns this phase end-to-end and dismisses the spinner itself after painting.
+     *                 It never transitions to 'rendering' to avoid StrictMode cancellation races.
+     */
+    phase: 'idle' | 'parsing' | 'rendering' | 'restoring';
     current: number;
     total: number;
     fileName: string;
@@ -171,18 +247,8 @@ interface LoadingState {
 
 // --- FILTER TYPES ---
 
-interface StringFilterCondition {
-    type: 'string';
-    value: string;
-    negated: boolean;
-}
-
-interface NumericFilterCondition {
-    type: 'numeric';
-    value: number;
-    operator: '=' | '!=' | '>' | '>=' | '<' | '<=';
-}
-
+interface StringFilterCondition { type: 'string'; value: string; negated: boolean; }
+interface NumericFilterCondition { type: 'numeric'; value: number; operator: '=' | '!=' | '>' | '>=' | '<' | '<='; }
 type FilterCondition = StringFilterCondition | NumericFilterCondition;
 interface FilterExpression { orGroups: FilterCondition[][]; }
 
@@ -190,12 +256,27 @@ interface FilterExpression { orGroups: FilterCondition[][]; }
 // CONSTANTS
 // ============================================================================
 
+/** localStorage key for persisted app settings (theme, toggles, column overrides, etc.) */
+const LOCALSTORAGE_SETTINGS_KEY = 'fidelityApp_settings';
+
+/** localStorage key for persisted dataset content (when rememberData is enabled) */
+const LOCALSTORAGE_DATA_KEY = 'fidelityApp_datasets';
+
+/**
+ * Maximum allowed size in megabytes for persisted dataset JSON in localStorage.
+ * Most browsers allow 5-10MB total for localStorage per origin.
+ * We reserve ~1MB for settings and other keys, so data gets the rest.
+ * If serialized data exceeds this, the write is silently skipped with a console warning.
+ */
+const LOCALSTORAGE_MAX_DATA_MB = 4;
+
 const DEFAULT_SETTINGS: AppSettings = {
     theme: 'light',
     firstRowIsHeader: false,
     firstColIsHeader: true,
     mergeFiles: false,
     stickyHeaders: true,
+    rememberData: false, // DISABLED BY DEFAULT — opt-in to avoid unexpected storage usage
     columnCustomNames: {},
     columnTypeOverrides: {},
 };
@@ -209,12 +290,36 @@ const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivit
 
 /**
  * Debounce delay in milliseconds for filter input.
- * Controls how long after the user stops typing before the filter is applied.
- * Lower values = more responsive but more CPU work on large datasets.
- * Higher values = less CPU churn but noticeable delay before results update.
  * Recommended range: 150–400ms. Default: 250ms.
  */
 const FILTER_DEBOUNCE_MS = 250;
+
+// ============================================================================
+// BOOT-RESTORE DETECTION (evaluated once at module load)
+// ============================================================================
+
+/**
+ * Synchronously determines at module load whether a boot-restore is needed.
+ * This value is used to:
+ *  1. Pre-activate the restoring spinner in loadingState initializer.
+ *  2. Pre-set isRestoringRef to prevent the persist effect from clearing data.
+ *  3. Gate the boot-restore useEffect.
+ */
+const NEEDS_BOOT_RESTORE: boolean = (() => {
+    try {
+        let rememberEnabled = DEFAULT_SETTINGS.rememberData;
+        const savedSettings = localStorage.getItem(LOCALSTORAGE_SETTINGS_KEY);
+        if (savedSettings) {
+            const parsed = JSON.parse(savedSettings);
+            if (typeof parsed.rememberData === 'boolean') rememberEnabled = parsed.rememberData;
+        }
+        if (!rememberEnabled) return false;
+        const raw = localStorage.getItem(LOCALSTORAGE_DATA_KEY);
+        return raw !== null && raw.length > 10;
+    } catch { return false; }
+})();
+
+dbg('NEEDS_BOOT_RESTORE =', NEEDS_BOOT_RESTORE);
 
 // ============================================================================
 // CSV PARSING
@@ -338,30 +443,20 @@ function tokenizeFilterInput(input: string): string[] {
     const tokens: string[] = [];
     let i = 0;
     const len = input.length;
-
     while (i < len) {
         if (input[i] === ' ' || input[i] === '\t') { i++; continue; }
         if (input[i] === ',') { tokens.push(','); i++; continue; }
-
         let token = '';
-
         if (input[i] === '!' && i + 1 < len) {
-            if (input[i + 1] === '"' || input[i + 1] === "'") {
-                token = '!'; i++;
-            } else {
-                token = '!'; i++;
-                while (i < len && input[i] !== ' ' && input[i] !== '\t' && input[i] !== ',') { token += input[i]; i++; }
-                tokens.push(token); continue;
-            }
+            if (input[i + 1] === '"' || input[i + 1] === "'") { token = '!'; i++; }
+            else { token = '!'; i++; while (i < len && input[i] !== ' ' && input[i] !== '\t' && input[i] !== ',') { token += input[i]; i++; } tokens.push(token); continue; }
         }
-
         if (input[i] === '"' || input[i] === "'") {
             const quote = input[i]; i++;
             while (i < len && input[i] !== quote) { token += input[i]; i++; }
             if (i < len) i++;
             tokens.push(token); continue;
         }
-
         while (i < len && input[i] !== ' ' && input[i] !== '\t' && input[i] !== ',') { token += input[i]; i++; }
         if (token) tokens.push(token);
     }
@@ -370,8 +465,7 @@ function tokenizeFilterInput(input: string): string[] {
 
 function parseStringToken(token: string): StringFilterCondition {
     const negated = token.startsWith('!');
-    const value = negated ? token.slice(1) : token;
-    return { type: 'string', value: value.toLowerCase(), negated };
+    return { type: 'string', value: (negated ? token.slice(1) : token).toLowerCase(), negated };
 }
 
 const NUMERIC_TOKEN_REGEX = /^(!?)(>=|<=|!=|>|<|=)?(-?[\d,.]+)$/;
@@ -385,8 +479,8 @@ function parseNumericToken(token: string): NumericFilterCondition | null {
     let operator: NumericFilterCondition['operator'];
     if (operatorStr) {
         if (negPrefix === '!') {
-            const inversions: Record<string, NumericFilterCondition['operator']> = { '>': '<=', '>=': '<', '<': '>=', '<=': '>', '=': '!=', '!=': '=' };
-            operator = inversions[operatorStr] || '=';
+            const inv: Record<string, NumericFilterCondition['operator']> = { '>': '<=', '>=': '<', '<': '>=', '<=': '>', '=': '!=', '!=': '=' };
+            operator = inv[operatorStr] || '=';
         } else { operator = operatorStr as NumericFilterCondition['operator']; }
     } else { operator = negPrefix === '!' ? '!=' : '='; }
     return { type: 'numeric', value, operator };
@@ -441,10 +535,69 @@ function applyFilters(rows: string[][], filters: Record<number, string>, getColT
 }
 
 // ============================================================================
+// DATA PERSISTENCE HELPERS
+// ============================================================================
+
+/**
+ * Attempts to save datasets to localStorage.
+ * Returns true if successful, false if data exceeds size limit or write fails.
+ */
+function persistDataSets(dataSets: DataSet[]): boolean {
+    try {
+        const json = JSON.stringify(dataSets);
+        const sizeMB = new Blob([json]).size / (1024 * 1024);
+        if (sizeMB > LOCALSTORAGE_MAX_DATA_MB) {
+            console.warn(
+                `[RememberData] Dataset size (${sizeMB.toFixed(2)}MB) exceeds limit (${LOCALSTORAGE_MAX_DATA_MB}MB). ` +
+                `Data will NOT be persisted. Consider clearing old data or disabling Remember Data.`
+            );
+            return false;
+        }
+        localStorage.setItem(LOCALSTORAGE_DATA_KEY, json);
+        return true;
+    } catch (err) {
+        console.warn('[RememberData] Failed to persist datasets to localStorage:', err);
+        return false;
+    }
+}
+
+/**
+ * Loads persisted datasets from localStorage.
+ * Returns the parsed array or null if nothing stored / parse fails.
+ */
+function loadPersistedDataSets(): DataSet[] | null {
+    try {
+        const raw = localStorage.getItem(LOCALSTORAGE_DATA_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed as DataSet[];
+        return null;
+    } catch (err) {
+        console.warn('[RememberData] Failed to load persisted datasets:', err);
+        return null;
+    }
+}
+
+/**
+ * Removes persisted datasets from localStorage.
+ */
+function clearPersistedDataSets(): void {
+    try { localStorage.removeItem(LOCALSTORAGE_DATA_KEY); } catch { /* ignore */ }
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
-function yieldToMain(): Promise<void> { return new Promise(r => setTimeout(r, 0)); }
+/** Debug-instrumented yield to main thread */
+function yieldToMain(label?: string): Promise<void> {
+    const tag = label ? `yieldToMain(${label})` : 'yieldToMain';
+    dbg(`${tag} — scheduling setTimeout`);
+    return new Promise(r => setTimeout(() => {
+        dbg(`${tag} — setTimeout fired`);
+        r();
+    }, 0));
+}
 
 function readFileAsText(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -455,8 +608,17 @@ function readFileAsText(file: File): Promise<string> {
     });
 }
 
-function waitForPaint(): Promise<void> {
-    return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+/** Debug-instrumented double-rAF paint waiter */
+function waitForPaint(label?: string): Promise<void> {
+    const tag = label ? `waitForPaint(${label})` : 'waitForPaint';
+    dbg(`${tag} — scheduling rAF 1`);
+    return new Promise(r => requestAnimationFrame(() => {
+        dbg(`${tag} — rAF 1 fired, scheduling rAF 2`);
+        requestAnimationFrame(() => {
+            dbg(`${tag} — rAF 2 fired — paint assumed complete`);
+            r();
+        });
+    }));
 }
 
 function getTotalRowCount(dataSets: DataSet[]): number {
@@ -469,9 +631,14 @@ function getTotalRowCount(dataSets: DataSet[]): number {
 
 const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
     if (!state.active) return null;
+
     const isParsing = state.phase === 'parsing';
     const isRendering = state.phase === 'rendering';
-    const progressFraction = isRendering ? 1 : state.total > 0 ? Math.max(state.current / state.total, 0) : 0;
+    const isRestoring = state.phase === 'restoring';
+
+    const progressFraction = isRendering || isRestoring
+        ? 1
+        : state.total > 0 ? Math.max(state.current / state.total, 0) : 0;
     const progressPercent = Math.round(progressFraction * 100);
 
     return (
@@ -482,18 +649,39 @@ const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
                     <svg className="absolute inset-0 w-full h-full -rotate-90" viewBox="0 0 80 80" fill="none"><circle cx="40" cy="40" r="34" stroke="currentColor" strokeWidth="6" strokeLinecap="round" strokeDasharray={`${2 * Math.PI * 34}`} strokeDashoffset={`${2 * Math.PI * 34 * (1 - progressFraction)}`} className="text-blue-500 dark:text-blue-400" style={{ transition: 'stroke-dashoffset 0.35s cubic-bezier(0.4,0,0.2,1)' }} /></svg>
                     <svg className="absolute inset-0 w-full h-full animate-spin" viewBox="0 0 80 80" fill="none" style={{ animationDuration: '1.1s' }}><circle cx="40" cy="40" r="34" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeDasharray="20 193" className="text-blue-400/60 dark:text-blue-300/50" /></svg>
                     <div className="relative z-10 flex items-center justify-center w-11 h-11 rounded-full bg-blue-50 dark:bg-blue-950/60 animate-pulse" style={{ animationDuration: '1.6s' }}>
-                        {isParsing ? <svg className="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                            : <svg className="w-5 h-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M3 14h18M10 3v18M14 3v18" /></svg>}
+                        {isParsing
+                            ? <svg className="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                            : isRestoring
+                                ? <svg className="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M4 7h16M9 3h6" /></svg>
+                                : <svg className="w-5 h-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M3 14h18M10 3v18M14 3v18" /></svg>
+                        }
                     </div>
                 </div>
                 <div className="flex flex-col items-center gap-1.5 text-center">
-                    <p className="text-base font-bold text-slate-800 dark:text-slate-100">{isParsing ? 'Processing Files…' : 'Rendering Table…'}</p>
-                    {isParsing ? <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-xs font-semibold"><span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse" />{state.current} of {state.total} parsed</span>
-                        : <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300 text-xs font-semibold"><span className="w-1.5 h-1.5 rounded-full bg-amber-500 dark:bg-amber-400 animate-pulse" />Building DOM layout…</span>}
+                    <p className="text-base font-bold text-slate-800 dark:text-slate-100">
+                        {isParsing ? 'Processing Files…' : isRestoring ? 'Restoring Data…' : 'Rendering Table…'}
+                    </p>
+                    {isParsing && (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-xs font-semibold">
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse" />{state.current} of {state.total} parsed
+                        </span>
+                    )}
+                    {isRestoring && (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300 text-xs font-semibold">
+                            <span className="w-1.5 h-1.5 rounded-full bg-purple-500 dark:bg-purple-400 animate-pulse" />Loading saved data…
+                        </span>
+                    )}
+                    {isRendering && (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300 text-xs font-semibold">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 dark:bg-amber-400 animate-pulse" />Building DOM layout…
+                        </span>
+                    )}
                 </div>
-                <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden"><div className={`h-full rounded-full transition-all duration-300 ease-out ${isRendering ? 'bg-amber-500 dark:bg-amber-400 animate-pulse' : 'bg-blue-500 dark:bg-blue-400'}`} style={{ width: `${progressPercent}%` }} /></div>
+                <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                    <div className={`h-full rounded-full transition-all duration-300 ease-out ${isRendering ? 'bg-amber-500 dark:bg-amber-400 animate-pulse' : isRestoring ? 'bg-purple-500 dark:bg-purple-400 animate-pulse' : 'bg-blue-500 dark:bg-blue-400'}`} style={{ width: `${progressPercent}%` }} />
+                </div>
                 {isParsing && state.fileName && <p className="text-xs text-slate-400 dark:text-slate-500 max-w-full truncate text-center font-mono" title={state.fileName}>{state.fileName}</p>}
-                {isRendering && <p className="text-[11px] text-slate-400 dark:text-slate-500 text-center leading-snug">Large tables may take a moment to paint.<br />The spinner will dismiss after the browser finishes.</p>}
+                {(isRendering || isRestoring) && <p className="text-[11px] text-slate-400 dark:text-slate-500 text-center leading-snug">Large tables may take a moment to paint.<br />The spinner will dismiss after the browser finishes.</p>}
             </div>
         </div>
     );
@@ -522,89 +710,27 @@ const InlineHeaderEditor: React.FC<{
 // FILTER INPUT COMPONENT (with debounce)
 // ============================================================================
 
-/**
- * Inline filter input rendered below each column header.
- *
- * Uses LOCAL state for the input value so typing is instant with zero lag,
- * then DEBOUNCES the actual filter application to the parent component
- * via `onFilterChange` after `FILTER_DEBOUNCE_MS` of inactivity.
- *
- * The debounce timer is stored in a `useRef` so it persists across renders
- * and is properly cleaned up on unmount.
- *
- * Clearing the filter (✗ button) bypasses the debounce and fires immediately.
- *
- * The `filterValue` prop from the parent is used to sync when filters are
- * cleared externally (e.g., "Clear All Filters" button or tab switch).
- */
 const ColumnFilterInput: React.FC<{
     colIndex: number;
     filterValue: string;
     colType: ColumnType;
     onFilterChange: (colIndex: number, value: string) => void;
 }> = ({ colIndex, filterValue, colType, onFilterChange }) => {
-    /**
-     * Local input state — drives the <input> value for instant keystroke feedback.
-     * Initialized from the parent's `filterValue` prop.
-     */
     const [localValue, setLocalValue] = useState(filterValue);
-
-    /**
-     * Ref to the debounce timer ID. Using a ref instead of state because
-     * we don't want clearing/setting the timer to trigger re-renders.
-     */
     const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    /**
-     * Sync local state when parent clears filters externally.
-     * This covers: "Clear All Filters" button, tab switches, merge toggle.
-     * We only sync when the parent value diverges from local (external reset).
-     */
-    useEffect(() => {
-        setLocalValue(filterValue);
-    }, [filterValue]);
+    useEffect(() => { setLocalValue(filterValue); }, [filterValue]);
+    useEffect(() => { return () => { if (debounceTimerRef.current !== null) clearTimeout(debounceTimerRef.current); }; }, []);
 
-    /**
-     * Cleanup the debounce timer on unmount to prevent stale callbacks.
-     */
-    useEffect(() => {
-        return () => {
-            if (debounceTimerRef.current !== null) {
-                clearTimeout(debounceTimerRef.current);
-            }
-        };
-    }, []);
-
-    /**
-     * Handles each keystroke: updates local state immediately,
-     * then schedules the debounced parent update.
-     */
     const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const newValue = e.target.value;
         setLocalValue(newValue);
-
-        // Clear any pending debounce timer
-        if (debounceTimerRef.current !== null) {
-            clearTimeout(debounceTimerRef.current);
-        }
-
-        // Schedule debounced filter application
-        debounceTimerRef.current = setTimeout(() => {
-            onFilterChange(colIndex, newValue);
-            debounceTimerRef.current = null;
-        }, FILTER_DEBOUNCE_MS);
+        if (debounceTimerRef.current !== null) clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = setTimeout(() => { onFilterChange(colIndex, newValue); debounceTimerRef.current = null; }, FILTER_DEBOUNCE_MS);
     };
 
-    /**
-     * Clear button handler — bypasses debounce for instant clearing.
-     * Clears both local state and parent filter immediately.
-     */
     const handleClear = () => {
-        // Cancel any pending debounce
-        if (debounceTimerRef.current !== null) {
-            clearTimeout(debounceTimerRef.current);
-            debounceTimerRef.current = null;
-        }
+        if (debounceTimerRef.current !== null) { clearTimeout(debounceTimerRef.current); debounceTimerRef.current = null; }
         setLocalValue('');
         onFilterChange(colIndex, '');
     };
@@ -615,19 +741,12 @@ const ColumnFilterInput: React.FC<{
 
     return (
         <div className={`flex items-center gap-0.5 w-full mt-1 transition-opacity ${isActive ? 'opacity-100' : 'opacity-0 group-hover/header:opacity-100'}`}>
-            <svg className={`w-3 h-3 shrink-0 ${isActive ? 'text-blue-500 dark:text-blue-400' : 'text-slate-400 dark:text-slate-500'}`}
-                 fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <svg className={`w-3 h-3 shrink-0 ${isActive ? 'text-blue-500 dark:text-blue-400' : 'text-slate-400 dark:text-slate-500'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
             </svg>
-            <input
-                type="text"
-                value={localValue}
-                onChange={handleInputChange}
-                placeholder={placeholder}
-                className={`w-full min-w-0 text-[10px] px-1 py-0.5 rounded font-normal bg-white dark:bg-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-500
-                    ${isActive ? 'border border-blue-400 dark:border-blue-600 text-slate-800 dark:text-slate-200' : 'border border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-400'}`}
-                title={isNumeric ? 'Numeric filter: =, !=, >, >=, <, <=. Space=AND, Comma=OR. Example: >10 <50' : 'Text filter: space=AND, comma=OR, !=NOT, "quotes"=phrase. Example: ab "cd e", !xyz'}
-            />
+            <input type="text" value={localValue} onChange={handleInputChange} placeholder={placeholder}
+                   className={`w-full min-w-0 text-[10px] px-1 py-0.5 rounded font-normal bg-white dark:bg-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-500 ${isActive ? 'border border-blue-400 dark:border-blue-600 text-slate-800 dark:text-slate-200' : 'border border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-400'}`}
+                   title={isNumeric ? 'Numeric filter: =, !=, >, >=, <, <=. Space=AND, Comma=OR.' : 'Text filter: space=AND, comma=OR, !=NOT, "quotes"=phrase.'} />
             {isActive && (
                 <button onClick={handleClear} className="shrink-0 p-0.5 rounded text-slate-400 hover:text-red-500 dark:hover:text-red-400 transition-colors" title="Clear filter">
                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>
@@ -644,8 +763,7 @@ const ColumnFilterInput: React.FC<{
 const ColumnHeader: React.FC<{
     header: string; colIndex: number; fileIndex: number;
     sortState: SortState; colType: ColumnType;
-    isEditing: boolean; editValue: string;
-    filterValue: string;
+    isEditing: boolean; editValue: string; filterValue: string;
     onEditChange: (v: string) => void; onEditStart: () => void;
     onEditSave: () => void; onEditCancel: () => void;
     onSort: (col: number, dir: 'asc' | 'desc') => void;
@@ -661,9 +779,7 @@ const ColumnHeader: React.FC<{
     const isAsc = isActiveSort && sortState.direction === 'asc';
     const isDesc = isActiveSort && sortState.direction === 'desc';
 
-    if (isEditing) {
-        return <InlineHeaderEditor value={editValue} onChange={onEditChange} onSave={onEditSave} onCancel={onEditCancel} isMergeView={isMergeView} />;
-    }
+    if (isEditing) return <InlineHeaderEditor value={editValue} onChange={onEditChange} onSave={onEditSave} onCancel={onEditCancel} isMergeView={isMergeView} />;
 
     return (
         <div className="flex flex-col w-full group/header">
@@ -679,9 +795,7 @@ const ColumnHeader: React.FC<{
                 <span className={`truncate flex-1 ${isMergeView ? '' : 'font-semibold'}`}>{header}</span>
                 <button onClick={e => { e.stopPropagation(); const i = ALL_COLUMN_TYPES.indexOf(colType); onTypeChange(colIndex, ALL_COLUMN_TYPES[(i + 1) % ALL_COLUMN_TYPES.length]); }}
                         className={`shrink-0 px-1.5 py-0 rounded text-[9px] font-bold leading-4 tracking-wide transition-all cursor-pointer border border-transparent hover:border-slate-400 dark:hover:border-slate-500 ${isActiveSort ? 'opacity-100' : 'opacity-0 group-hover/header:opacity-70'} ${COLUMN_TYPE_COLORS[colType]}`}
-                        title={`Column type: ${colType}. Click to cycle.`}>
-                    {COLUMN_TYPE_LABELS[colType]}
-                </button>
+                        title={`Column type: ${colType}. Click to cycle.`}>{COLUMN_TYPE_LABELS[colType]}</button>
                 <button onClick={onEditStart} className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-0.5 shrink-0" title="Rename Column">
                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
                 </button>
@@ -702,44 +816,232 @@ const ColumnHeader: React.FC<{
 // ============================================================================
 
 const App: React.FC = () => {
+    dbg('App component rendering');
+
+    // -------------------------------------------------------------------------
+    // Settings — initialized synchronously (small JSON payload, negligible cost;
+    // must be synchronous so the dark/light class is applied before first paint).
+    // -------------------------------------------------------------------------
     const [settings, setSettings] = useState<AppSettings>(() => {
         if (typeof window !== 'undefined') {
-            const saved = localStorage.getItem('fidelityApp_settings');
+            const saved = localStorage.getItem(LOCALSTORAGE_SETTINGS_KEY);
             if (saved) { try { return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) }; } catch { /* ignore */ } }
         }
         return DEFAULT_SETTINGS;
     });
 
+    /**
+     * Datasets always start EMPTY — restored asynchronously after first paint.
+     * See: "Async Boot Restore" useEffect below.
+     */
     const [dataSets, setDataSets] = useState<DataSet[]>([]);
+
     const [activeTab, setActiveTab] = useState<number>(0);
-    const [loadingState, setLoadingState] = useState<LoadingState>(DEFAULT_LOADING_STATE);
+
+    /**
+     * Loading state initializer:
+     * If NEEDS_BOOT_RESTORE is true, we pre-activate the spinner synchronously
+     * during useState initialization so the very first render already shows
+     * the spinner overlay — no flash of empty content.
+     */
+    const [loadingState, setLoadingState] = useState<LoadingState>(() => {
+        if (NEEDS_BOOT_RESTORE) {
+            dbg('Init loadingState — pre-activating restoring spinner');
+            return { active: true, phase: 'restoring', current: 0, total: 0, fileName: '' };
+        }
+        return DEFAULT_LOADING_STATE;
+    });
+
     const [sortState, setSortState] = useState<SortState>(DEFAULT_SORT_STATE);
     const [editingHeaderKey, setEditingHeaderKey] = useState<string | null>(null);
     const [editHeaderValue, setEditHeaderValue] = useState<string>('');
     const [columnFilters, setColumnFilters] = useState<Record<number, string>>({});
 
+    /**
+     * Stable ref holding the rememberData flag from the synchronous settings init.
+     */
+    const rememberDataRef = useRef<boolean>(settings.rememberData);
+
+    /**
+     * Flag set during the boot-restore cycle to suppress the dataSets persistence
+     * useEffect from firing and deleting the localStorage data before it's been read.
+     *
+     * CRITICAL: initialized to `true` when NEEDS_BOOT_RESTORE is true.
+     * This prevents the persist effect from running on the very first render
+     * (before the boot-restore effect has even had a chance to fire) and
+     * clearing the localStorage data.
+     */
+    const isRestoringRef = useRef<boolean>(NEEDS_BOOT_RESTORE);
+
+    /**
+     * Monotonically increasing counter for StrictMode-safe boot-restore.
+     */
+    const restoreRunIdRef = useRef<number>(0);
+
     const fileInputRef = useRef<HTMLInputElement>(null);
 
+    // -------------------------------------------------------------------------
+    // ASYNC BOOT RESTORE
+    // -------------------------------------------------------------------------
     useEffect(() => {
-        localStorage.setItem('fidelityApp_settings', JSON.stringify(settings));
+        dbg('BootRestore effect fired', {
+            NEEDS_BOOT_RESTORE,
+            rememberData: rememberDataRef.current,
+            isRestoringRef: isRestoringRef.current,
+        });
+
+        if (!NEEDS_BOOT_RESTORE) {
+            dbg('BootRestore — NEEDS_BOOT_RESTORE is false, skipping');
+            return;
+        }
+
+        // Increment run ID and capture it for this closure
+        restoreRunIdRef.current += 1;
+        const myRunId = restoreRunIdRef.current;
+        dbg(`BootRestore run #${myRunId} — starting`);
+
+        const isStale = () => {
+            const stale = restoreRunIdRef.current !== myRunId;
+            if (stale) dbg(`BootRestore run #${myRunId} — STALE (current is #${restoreRunIdRef.current}), aborting`);
+            return stale;
+        };
+
+        const restore = async () => {
+            // Step 1: Ensure spinner is active
+            dbg(`BootRestore #${myRunId} step 1 — ensuring restoring spinner`);
+            setLoadingState({ active: true, phase: 'restoring', current: 0, total: 0, fileName: '' });
+
+            // Step 2: Yield so React can flush spinner to DOM
+            dbg(`BootRestore #${myRunId} step 2 — yieldToMain`);
+            await yieldToMain(`restore#${myRunId}-flush`);
+            if (isStale()) return;
+
+            // Step 3: Wait for browser to paint spinner
+            dbg(`BootRestore #${myRunId} step 3 — waitForPaint`);
+            await waitForPaint(`restore#${myRunId}-spinnerPaint`);
+            if (isStale()) return;
+
+            // Step 4: Parse localStorage
+            dbg(`BootRestore #${myRunId} step 4 — loadPersistedDataSets`);
+            const restored = loadPersistedDataSets();
+            dbg(`BootRestore #${myRunId} step 4 result`, {
+                found: !!restored,
+                count: restored?.length ?? 0,
+                firstFileName: restored?.[0]?.fileName ?? 'N/A',
+                firstRowCount: restored?.[0]?.data?.length ?? 0,
+            });
+            if (isStale()) return;
+
+            if (!restored || restored.length === 0) {
+                dbg(`BootRestore #${myRunId} — no valid data, dismissing`);
+                setLoadingState(DEFAULT_LOADING_STATE);
+                isRestoringRef.current = false;
+                return;
+            }
+
+            // Step 5: Commit data
+            dbg(`BootRestore #${myRunId} step 5 — setDataSets (${restored.length} datasets)`);
+            setDataSets(restored);
+
+            // Step 6: Yield for React re-render
+            dbg(`BootRestore #${myRunId} step 6 — yieldToMain (React re-render)`);
+            await yieldToMain(`restore#${myRunId}-rerender`);
+            if (isStale()) { isRestoringRef.current = false; return; }
+
+            // Step 7: Wait for paint pass 1
+            dbg(`BootRestore #${myRunId} step 7 — waitForPaint pass 1`);
+            await waitForPaint(`restore#${myRunId}-paint1`);
+            if (isStale()) { isRestoringRef.current = false; return; }
+
+            // Step 8: Wait for paint pass 2
+            dbg(`BootRestore #${myRunId} step 8 — waitForPaint pass 2`);
+            await waitForPaint(`restore#${myRunId}-paint2`);
+            if (isStale()) { isRestoringRef.current = false; return; }
+
+            // Step 9: Extra yield + paint for very large merge tables
+            dbg(`BootRestore #${myRunId} step 9 — final yieldToMain + waitForPaint`);
+            await yieldToMain(`restore#${myRunId}-final`);
+            if (isStale()) { isRestoringRef.current = false; return; }
+            await waitForPaint(`restore#${myRunId}-paint3`);
+            if (isStale()) { isRestoringRef.current = false; return; }
+
+            // Step 10: Dismiss spinner
+            dbg(`BootRestore #${myRunId} step 10 — dismissing spinner`);
+            setLoadingState(DEFAULT_LOADING_STATE);
+            isRestoringRef.current = false;
+            dbg(`BootRestore #${myRunId} — DONE ✓`);
+        };
+
+        restore().catch(err => {
+            console.error(`[BootRestore #${myRunId}] UNCAUGHT ERROR:`, err);
+            if (!isStale()) {
+                setLoadingState(DEFAULT_LOADING_STATE);
+                isRestoringRef.current = false;
+            }
+        });
+
+        // No cleanup needed — stale-ID pattern handles everything
+        return undefined;
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // --- Theme & settings cache sync ---
+    useEffect(() => {
+        localStorage.setItem(LOCALSTORAGE_SETTINGS_KEY, JSON.stringify(settings));
         if (settings.theme === 'dark') document.documentElement.classList.add('dark');
         else document.documentElement.classList.remove('dark');
     }, [settings]);
 
+    // --- Persist datasets when rememberData is enabled ---
+    useEffect(() => {
+        // Skip writes during the boot-restore cycle to prevent clearing
+        // localStorage before the restore effect has read the data.
+        if (isRestoringRef.current) {
+            dbg('PersistEffect — SKIPPED (isRestoring is true)');
+            return;
+        }
+
+        if (settings.rememberData) {
+            if (dataSets.length > 0) {
+                dbg('PersistEffect — persisting', dataSets.length, 'datasets');
+                persistDataSets(dataSets);
+            } else {
+                dbg('PersistEffect — clearing persisted data (empty datasets)');
+                clearPersistedDataSets();
+            }
+        }
+    }, [dataSets, settings.rememberData]);
+
+    // --- Paint detection for rendering phase (CSV import & settings toggles ONLY) ---
     useEffect(() => {
         if (loadingState.phase !== 'rendering') return;
+        dbg('RenderingEffect — phase is rendering, waiting for paint');
         let cancelled = false;
-        const go = async () => { await waitForPaint(); await waitForPaint(); if (!cancelled) setLoadingState(DEFAULT_LOADING_STATE); };
+        const go = async () => {
+            await waitForPaint('renderingEffect-1');
+            await waitForPaint('renderingEffect-2');
+            if (!cancelled) {
+                dbg('RenderingEffect — dismissing spinner');
+                setLoadingState(DEFAULT_LOADING_STATE);
+            } else {
+                dbg('RenderingEffect — cancelled before dismiss');
+            }
+        };
         go();
-        return () => { cancelled = true; };
+        return () => {
+            dbg('RenderingEffect — cleanup');
+            cancelled = true;
+        };
     }, [loadingState.phase]);
 
+    // --- Reset sort and filters on tab/merge change ---
     useEffect(() => {
         setSortState(DEFAULT_SORT_STATE);
         setColumnFilters({});
     }, [activeTab, settings.mergeFiles]);
 
-    const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => setSettings(prev => ({ ...prev, [key]: value }));
+    const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
+        setSettings(prev => ({ ...prev, [key]: value }));
 
     const updateSettingWithSpinner = useCallback(async <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
         const totalRows = getTotalRowCount(dataSets);
@@ -750,20 +1052,42 @@ const App: React.FC = () => {
         setSettings(prev => ({ ...prev, [key]: value }));
     }, [dataSets]);
 
+    const handleToggleRememberData = useCallback((enabled: boolean) => {
+        rememberDataRef.current = enabled;
+        setSettings(prev => ({ ...prev, rememberData: enabled }));
+        if (enabled) {
+            if (dataSets.length > 0) {
+                const success = persistDataSets(dataSets);
+                if (!success) {
+                    alert(
+                        `Dataset is too large to persist (limit: ${LOCALSTORAGE_MAX_DATA_MB}MB). ` +
+                        `The setting will stay enabled for smaller future imports.`
+                    );
+                }
+            }
+        } else {
+            clearPersistedDataSets();
+        }
+    }, [dataSets]);
+
     const handleResetSettings = useCallback(async () => {
         if (getTotalRowCount(dataSets) >= EXPENSIVE_TOGGLE_ROW_THRESHOLD) {
             setLoadingState({ active: true, phase: 'rendering', current: 0, total: 0, fileName: '' });
             await yieldToMain();
         }
+        rememberDataRef.current = DEFAULT_SETTINGS.rememberData;
         setSettings(DEFAULT_SETTINGS);
         setSortState(DEFAULT_SORT_STATE);
         setColumnFilters({});
+        clearPersistedDataSets();
     }, [dataSets]);
 
     const handleExportSettings = () => {
         const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob); const a = document.createElement('a');
-        a.href = url; a.download = 'fidelity_settings.json'; a.click(); URL.revokeObjectURL(url);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'fidelity_settings.json'; a.click();
+        URL.revokeObjectURL(url);
     };
 
     const handleImportSettings = useCallback(async (e: ChangeEvent<HTMLInputElement>) => {
@@ -777,11 +1101,15 @@ const App: React.FC = () => {
                         setLoadingState({ active: true, phase: 'rendering', current: 0, total: 0, fileName: '' });
                         await yieldToMain();
                     }
-                    setSettings({ ...DEFAULT_SETTINGS, ...imported });
+                    const newSettings = { ...DEFAULT_SETTINGS, ...imported };
+                    rememberDataRef.current = newSettings.rememberData;
+                    setSettings(newSettings);
+                    if (!newSettings.rememberData) clearPersistedDataSets();
                 }
             } catch { alert("Invalid JSON format"); }
         };
-        reader.readAsText(file); e.target.value = '';
+        reader.readAsText(file);
+        e.target.value = '';
     }, [dataSets]);
 
     const handleTriggerFileInput = () => fileInputRef.current?.click();
@@ -812,17 +1140,35 @@ const App: React.FC = () => {
         const files = e.target.files; if (!files || files.length === 0) return;
         const fileArray = Array.from(files);
         e.target.value = '';
-        processFilesAsync(fileArray).catch(err => { console.error('Unexpected error:', err); setLoadingState(DEFAULT_LOADING_STATE); });
+        processFilesAsync(fileArray).catch(err => {
+            console.error('Unexpected error:', err);
+            setLoadingState(DEFAULT_LOADING_STATE);
+        });
     }, [processFilesAsync]);
 
-    const handleClearData = () => { setDataSets([]); setActiveTab(0); setSortState(DEFAULT_SORT_STATE); setColumnFilters({}); };
+    const handleClearData = () => {
+        setDataSets([]);
+        setActiveTab(0);
+        setSortState(DEFAULT_SORT_STATE);
+        setColumnFilters({});
+        clearPersistedDataSets();
+    };
 
-    const startEditingHeader = (fileIndex: number, colIndex: number, currentValue: string) => { setEditingHeaderKey(`${fileIndex}-${colIndex}`); setEditHeaderValue(currentValue); };
-    const saveHeaderName = (colIndex: number) => { if (editHeaderValue.trim() !== '') setSettings(prev => ({ ...prev, columnCustomNames: { ...prev.columnCustomNames, [colIndex]: editHeaderValue.trim() } })); setEditingHeaderKey(null); };
+    const startEditingHeader = (fileIndex: number, colIndex: number, currentValue: string) => {
+        setEditingHeaderKey(`${fileIndex}-${colIndex}`);
+        setEditHeaderValue(currentValue);
+    };
+    const saveHeaderName = (colIndex: number) => {
+        if (editHeaderValue.trim() !== '')
+            setSettings(prev => ({ ...prev, columnCustomNames: { ...prev.columnCustomNames, [colIndex]: editHeaderValue.trim() } }));
+        setEditingHeaderKey(null);
+    };
     const cancelEditingHeader = () => { setEditingHeaderKey(null); setEditHeaderValue(''); };
 
     const handleSort = useCallback((colIndex: number, direction: 'asc' | 'desc') => {
-        setSortState(prev => prev.columnIndex === colIndex && prev.direction === direction ? DEFAULT_SORT_STATE : { columnIndex: colIndex, direction });
+        setSortState(prev => prev.columnIndex === colIndex && prev.direction === direction
+            ? DEFAULT_SORT_STATE
+            : { columnIndex: colIndex, direction });
     }, []);
 
     const handleTypeChange = useCallback((colIndex: number, newType: ColumnType) => {
@@ -842,7 +1188,9 @@ const App: React.FC = () => {
         if (fileRawRows.length === 0) return { headers: [] as string[], rows: [] as string[][] };
         const totalColumns = fileRawRows[0].length;
         const fileHeaders = settings.firstRowIsHeader ? fileRawRows[0] : [];
-        const headers = Array.from({ length: totalColumns }, (_, i) => settings.columnCustomNames[i] || (settings.firstRowIsHeader && fileHeaders[i] ? fileHeaders[i] : `Col ${i + 1}`));
+        const headers = Array.from({ length: totalColumns }, (_, i) =>
+            settings.columnCustomNames[i] || (settings.firstRowIsHeader && fileHeaders[i] ? fileHeaders[i] : `Col ${i + 1}`)
+        );
         const rows = settings.firstRowIsHeader ? fileRawRows.slice(1) : fileRawRows;
         return { headers, rows };
     }, [settings.firstRowIsHeader, settings.columnCustomNames]);
@@ -902,6 +1250,10 @@ const App: React.FC = () => {
                             <input type="checkbox" checked={settings.firstColIsHeader} onChange={e => updateSettingWithSpinner('firstColIsHeader', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
                             <span className="font-medium">1st Col = Sticky</span>
                         </label>
+                        <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
+                            <input type="checkbox" checked={settings.rememberData} onChange={e => handleToggleRememberData(e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
+                            <span className={`font-semibold ${settings.rememberData ? 'text-orange-600 dark:text-orange-400' : 'text-slate-500'}`}>Remember Data</span>
+                        </label>
                         <button onClick={() => updateSetting('theme', settings.theme === 'light' ? 'dark' : 'light')} className="p-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition" title="Toggle Theme">
                             {settings.theme === 'light' ? '🌙' : '☀️'}
                         </button>
@@ -921,15 +1273,13 @@ const App: React.FC = () => {
                             <button onClick={handleResetSettings} className="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 transition font-medium">Reset</button>
                             <button onClick={handleExportSettings} className="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 transition font-medium">Export JSON</button>
                             <label className="cursor-pointer px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 transition font-medium">Import JSON<input type="file" accept=".json" className="hidden" onChange={handleImportSettings} /></label>
-                            {hasActiveFilters && (
-                                <button onClick={() => setColumnFilters({})} className="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-medium text-xs">Clear All Filters</button>
-                            )}
+                            {hasActiveFilters && <button onClick={() => setColumnFilters({})} className="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-medium text-xs">Clear All Filters</button>}
                         </div>
                     </div>
 
                     {dataSets.length === 0 && !loadingState.active ? (
                         <div onClick={handleTriggerFileInput} className="flex-1 flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl bg-slate-50/50 dark:bg-slate-900/50 cursor-pointer group hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50/20 dark:hover:bg-blue-950/10 transition-all duration-200">
-                            <svg className="w-16 h-16 mb-4 opacity-50 group-hover:opacity-80 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-all duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                            <svg className="w-16 h-16 mb-4 opacity-50 group-hover:opacity-80 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-all duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
                             <p className="text-lg font-medium group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">No CSV files loaded</p>
                             <p className="text-sm opacity-80 group-hover:opacity-100 transition-opacity">Upload raw Fidelity files, the app will auto-clean them.</p>
                         </div>
