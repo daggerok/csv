@@ -3,12 +3,12 @@
  * AGENTIC AI ENFORCED SPECIFICATION & GUIDELINES (CRITICAL)
  * ============================================================================
  * 1. PERSIST ALL COMMENTS: Under no circumstances should ANY code comments,
- *    system design docs, or type descriptors be removed or truncated.
+ * system design docs, or type descriptors be removed or truncated.
  * 2. AGENT READ-WRITE RULE: If a future deployment or agent updates the code,
- *    this header section and related documentation blocks MUST be kept accurate,
- *    expanded, and dynamically synchronized with the feature upgrades.
+ * this header section and related documentation blocks MUST be kept accurate,
+ * expanded, and dynamically synchronized with the feature upgrades.
  * 3. SINGLE-FILE CONTINUITY: Keep the core architecture completely self-contained
- *    within this file to maximize maintainability for automated development pipelines.
+ * within this file to maximize maintainability for automated development pipelines.
  * ============================================================================
  *
  * ============================================================================
@@ -20,13 +20,13 @@
  *
  * MODULES & FEATURES:
  * 1. [Types & State Management]
- * - `AppSettings`: Stores UI/UX settings (theme, header configurations, and
- * custom column name mappings).
+ * - `AppSettings`: Stores UI/UX settings (theme, header configurations,
+ * multi-file merge state, custom column name mappings, and structural sticky flags).
  * - `DataSet`: Represents a parsed CSV file with cleaned table rows.
  * - Settings are initialized SYNCHRONOUSLY from `localStorage` to prevent
  * race conditions and theme flickering during development/strict mode.
  * - Export/Import settings to JSON allows multi-project configurations,
- * including persistence of custom column headers.
+ * including persistence of custom column headers, merge, and sticky toggles.
  *
  * 2. [Heuristic CSV Parser (`parseCSVRow` & `extractValidTableData`)]
  * - Fidelity CSVs contain unstructured preamble/postamble.
@@ -42,18 +42,20 @@
  * - Works universally: if a file has no header row, user-defined names are preserved
  * and injected seamlessly across file reloads.
  *
- * 4. [Natural Sort Order Synchronization]
+ * 4. [Multi-File Merging & Flex/Grid Cross-Axis Sticky Layout Engine]
+ * - Toggleable `mergeFiles` strategy inside app settings layout.
+ * - Toggleable `stickyHeaders` control switch to explicitly manage layout viewports.
+ * - Tab View (Disabled): Standard separate tab selection between isolated sheets.
+ * - Merge View (Enabled): Disables tabs and cascades all selected files sequentially.
+ * - Multi-Axis Fixed Layout: Replaces native tables in Merge mode with structured
+ * CSS Grid row containers. The filename banner utilizes dual-axis stickiness (`sticky top-0 left-0`)
+ * alongside an adaptive explicit dynamic content width (`w-max min-w-full`) to freeze on both
+ * vertical and horizontal scrolls without subpixel gap separation leaks.
+ *
+ * 5. [Natural Sort Order Synchronization]
  * - Uses `Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })`
  * to sort imported datasets by file name natively. This ensures `file2.csv`
  * appears before `file10.csv`.
- *
- * 5. [UI Components & UX Fixes]
- * - Mobile-first approach using standard Tailwind utility classes.
- * - Features a dark/light mode toggle integrated with `<html class="dark">`.
- * - Table supports `sticky top-0` (Header row) and `sticky left-0` (First Column)
- * based on user configuration.
- * - Interactive Empty Placeholder Container acts as a global dropzone/button
- * linked to a hidden file input via `useRef`.
  *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
@@ -70,6 +72,8 @@ interface AppSettings {
     theme: 'light' | 'dark';
     firstRowIsHeader: boolean;
     firstColIsHeader: boolean;
+    mergeFiles: boolean; // Enables infinite layout merging
+    stickyHeaders: boolean; // Explicit control switch to force lock headers during scroll
     columnCustomNames: Record<number, string>; // Stores custom column names by index
 }
 
@@ -82,6 +86,8 @@ const DEFAULT_SETTINGS: AppSettings = {
     theme: 'light',
     firstRowIsHeader: false, // DISABLED BY DEFAULT
     firstColIsHeader: true,  // ENABLED BY DEFAULT
+    mergeFiles: false,       // DISABLED BY DEFAULT
+    stickyHeaders: true,     // ENABLED BY DEFAULT (Enforces fixed layout visibility)
     columnCustomNames: {},
 };
 
@@ -127,8 +133,6 @@ function extractValidTableData(rawText: string): string[][] {
 
     if (parsedLines.length === 0) return [];
 
-    // Find the most common column length (usually the main table's column count)
-    // Ignoring rows with < 3 columns as they are usually preambles.
     const colCounts: Record<number, number> = {};
     parsedLines.forEach(row => {
         if (row.length > 2) {
@@ -145,27 +149,23 @@ function extractValidTableData(rawText: string): string[][] {
         }
     }
 
-    // Fallback if the file is extremely small or simple
     if (targetColLength === 0) {
         targetColLength = Math.max(...parsedLines.map(r => r.length));
     }
 
-    // Extract the longest contiguous block of rows matching the target column length
     const tableData: string[][] = [];
     let isRecording = false;
 
     for (const row of parsedLines) {
-        // We allow a slight deviation (e.g., trailing empty commas) but generally expect exact length
         if (row.length === targetColLength || row.length === targetColLength + 1) {
             isRecording = true;
             tableData.push(row.slice(0, targetColLength)); // Normalize length
         } else if (isRecording && row.length < targetColLength - 1) {
-            // If we drop off significantly, we probably hit the footer/legal text
             break;
         }
     }
 
-    return tableData.length > 0 ? tableData : parsedLines; // Return raw if heuristic fails
+    return tableData.length > 0 ? tableData : parsedLines;
 }
 
 
@@ -268,7 +268,6 @@ const App: React.FC = () => {
                 if (processedCount === pendingFiles.length) {
                     setDataSets(prev => {
                         const combined = [...prev, ...newResults];
-                        // Применяем натуральную сортировку по имени файла
                         return combined.sort((a, b) => naturalCollator.compare(a.fileName, b.fileName));
                     });
                 }
@@ -303,45 +302,52 @@ const App: React.FC = () => {
         setEditingHeaderIdx(null);
     };
 
-    // --- DATA TRANSFORMATION WORKFLOW ---
-    const activeData = dataSets[activeTab]?.data || [];
+    // --- DATA TRANSFORMATION SUB-ROUTINE ---
+    const getFileHeadersAndRows = (fileRawRows: string[][]) => {
+        if (fileRawRows.length === 0) return { headers: [], rows: [] };
 
-    // Compile final display headers factoring in 1) File Content, 2) Custom Configurations Registry
-    const displayHeaders = useMemo(() => {
-        if (activeData.length === 0) return [];
+        const totalColumns = fileRawRows[0].length;
+        const fileHeaders = settings.firstRowIsHeader ? fileRawRows[0] : [];
 
-        const totalColumns = activeData[0].length;
-        const fileHeaders = settings.firstRowIsHeader ? activeData[0] : [];
-
-        return Array.from({ length: totalColumns }, (_, i) => {
-            // Priority 1: User customized manual rename inside registry
+        const headers = Array.from({ length: totalColumns }, (_, i) => {
             if (settings.columnCustomNames[i]) {
                 return settings.columnCustomNames[i];
             }
-            // Priority 2: Use file native parsed row if checkbox is on
             if (settings.firstRowIsHeader && fileHeaders[i]) {
                 return fileHeaders[i];
             }
-            // Fallback: Default column tag index
             return `Col ${i + 1}`;
         });
-    }, [activeData, settings.firstRowIsHeader, settings.columnCustomNames]);
 
-    const displayRows = settings.firstRowIsHeader ? activeData.slice(1) : activeData;
+        const rows = settings.firstRowIsHeader ? fileRawRows.slice(1) : fileRawRows;
+        return { headers, rows };
+    };
+
+    const activeData = dataSets[activeTab]?.data || [];
+    const isolatedTable = useMemo(() => getFileHeadersAndRows(activeData), [activeData, settings.firstRowIsHeader, settings.columnCustomNames]);
 
     return (
-        <div className="min-h-screen bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100 transition-colors duration-300 font-sans flex flex-col">
+        <div className="h-screen bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100 transition-colors duration-300 font-sans flex flex-col overflow-hidden">
 
             {/* HEADER */}
-            <header className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-4 py-3 flex flex-col sm:flex-row justify-between items-center gap-4 z-20">
+            <header className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-4 py-3 flex flex-col sm:flex-row justify-between items-center gap-4 z-40 shadow-xs shrink-0">
                 <div className="flex items-center gap-2">
-                    {/* File Icon SVG */}
                     <svg className="w-6 h-6 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
                     <h1 className="text-xl font-bold tracking-tight">Fidelity Data Cleaner</h1>
                 </div>
 
                 {/* SETTINGS BAR */}
                 <div className="flex flex-wrap items-center gap-3 text-sm">
+                    <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
+                        <input type="checkbox" checked={settings.stickyHeaders} onChange={(e) => updateSetting('stickyHeaders', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
+                        <span className={`font-semibold ${settings.stickyHeaders ? 'text-green-600 dark:text-green-400' : 'text-slate-500'}`}>Sticky Headers</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
+                        <input type="checkbox" checked={settings.mergeFiles} onChange={(e) => updateSetting('mergeFiles', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
+                        <span className="font-semibold text-blue-600 dark:text-blue-400">Merge Files</span>
+                    </label>
+
                     <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
                         <input type="checkbox" checked={settings.firstRowIsHeader} onChange={(e) => updateSetting('firstRowIsHeader', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
                         <span className="font-medium">1st Row = Header</span>
@@ -358,10 +364,9 @@ const App: React.FC = () => {
                 </div>
             </header>
 
-            {/* MAIN CONTENT */}
-            <main className="flex-1 flex flex-col p-4 gap-4 max-w-full overflow-hidden animate-fade-in">
+            {/* MAIN CONTENT CONTAINER */}
+            <main className="flex-1 flex flex-col p-4 gap-4 max-w-full overflow-hidden min-h-0 bg-slate-50 dark:bg-slate-900 transition-colors duration-300">
 
-                {/* CENTRAL MASTER INPUT REGISTER */}
                 <input
                     type="file"
                     ref={fileInputRef}
@@ -372,7 +377,7 @@ const App: React.FC = () => {
                 />
 
                 {/* CONTROLS & IMPORT */}
-                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-slate-950 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-slate-950 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm shrink-0">
                     <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
                         <button
                             onClick={handleTriggerFileInput}
@@ -398,7 +403,7 @@ const App: React.FC = () => {
                     </div>
                 </div>
 
-                {/* DATA DISPLAY AREA */}
+                {/* DATA VIEWPORT COMPONENT */}
                 {dataSets.length === 0 ? (
                     <div
                         onClick={handleTriggerFileInput}
@@ -412,91 +417,196 @@ const App: React.FC = () => {
                     </div>
                 ) : (
                     <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
-                        {/* TABS */}
-                        <div className="flex overflow-x-auto border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 px-2 py-2 gap-2 hide-scrollbar">
-                            {dataSets.map((dataset, idx) => (
-                                <button
-                                    key={idx}
-                                    onClick={() => setActiveTab(idx)}
-                                    className={`px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-colors ${
-                                        activeTab === idx
-                                            ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700'
-                                            : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50'
-                                    }`}
-                                >
-                                    {dataset.fileName}
-                                </button>
-                            ))}
-                        </div>
 
-                        {/* TABLE CONTAINER */}
-                        <div className="flex-1 overflow-auto table-container relative">
-                            <table className="w-full text-left border-collapse text-sm whitespace-nowrap">
-                                <thead className="sticky top-0 z-10 shadow-sm">
-                                <tr className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
-                                    {displayHeaders.map((header, i) => (
-                                        <th
-                                            key={i}
-                                            className={`px-4 py-2 border-b border-slate-300 dark:border-slate-700 
-                                                ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 bg-slate-100 dark:bg-slate-800 z-20 border-r' : ''}`
-                                            }
-                                        >
-                                            {editingHeaderIdx === i ? (
-                                                <div className="flex items-center gap-1">
-                                                    <input
-                                                        type="text"
-                                                        value={editHeaderValue}
-                                                        onChange={(e) => setEditHeaderValue(e.target.value)}
-                                                        onBlur={() => saveHeaderName(i)}
-                                                        onKeyDown={(e) => e.key === 'Enter' && saveHeaderName(i)}
-                                                        className="bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 px-2 py-1 rounded border border-blue-500 focus:outline-none text-xs font-normal"
-                                                        autoFocus
-                                                    />
-                                                </div>
-                                            ) : (
-                                                <div className="flex items-center justify-between gap-4 group/header">
-                                                    <span className="font-semibold">{header}</span>
-                                                    <button
-                                                        onClick={() => startEditingHeader(i, header)}
-                                                        className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-1"
-                                                        title="Rename Column"
-                                                    >
-                                                        {/* Pencil SVG */}
-                                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
-                                                    </button>
-                                                </div>
-                                            )}
-                                        </th>
-                                    ))}
-                                </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-                                {displayRows.map((row, rowIndex) => (
-                                    <tr key={rowIndex} className="hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
-                                        {displayHeaders.map((_, colIndex) => {
-                                            const cellValue = row[colIndex] || '';
-                                            return (
-                                                <td
-                                                    key={colIndex}
-                                                    className={`px-4 py-2 text-slate-800 dark:text-slate-300
-                                                        ${settings.firstColIsHeader && colIndex === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-0 border-r border-slate-200 dark:border-slate-800' : ''}`
-                                                    }
-                                                >
-                                                    {cellValue}
-                                                </td>
-                                            );
-                                        })}
-                                    </tr>
+                        {/* TABS (Rendered only if Merge mode is disabled) */}
+                        {!settings.mergeFiles && (
+                            <div className="flex overflow-x-auto border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 px-2 py-2 gap-2 hide-scrollbar shrink-0">
+                                {dataSets.map((dataset, idx) => (
+                                    <button
+                                        key={idx}
+                                        onClick={() => setActiveTab(idx)}
+                                        className={`px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-colors ${
+                                            activeTab === idx
+                                                ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700'
+                                                : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50'
+                                        }`}
+                                    >
+                                        {dataset.fileName}
+                                    </button>
                                 ))}
-                                {displayRows.length === 0 && (
-                                    <tr>
-                                        <td colSpan={displayHeaders.length || 1} className="px-4 py-8 text-center text-slate-500">
-                                            No table data successfully extracted. Check file structure.
-                                        </td>
+                            </div>
+                        )}
+
+                        {/* ISOLATED VIEWPORT SCROLL CONTAINER */}
+                        <div className="flex-1 overflow-auto table-container relative min-h-0">
+
+                            {settings.mergeFiles ? (
+                                /* =========================================================================
+                                   MERGE WORKSPACE: Multi-file contiguous scrolling layout (Flexbox/Grid hybrid)
+                                   ========================================================================= */
+                                <div className="space-y-12 bg-slate-50/30 dark:bg-slate-900/10 w-max min-w-full">
+                                    {dataSets.map((dataset, fileIdx) => {
+                                        const { headers, rows } = getFileHeadersAndRows(dataset.data);
+                                        return (
+                                            <div key={fileIdx} className="relative border-b border-slate-200 dark:border-slate-800 last:border-none bg-white dark:bg-slate-950 flex flex-col w-full">
+
+                                                {/* Sticky Header Wrapper Context - Houses name and tags without physical DOM breaks */}
+                                                {/* ИСПРАВЛЕНИЕ: -mb-px намертво склеивает плашку с контентом снизу */}
+                                                <div className={`${settings.stickyHeaders ? 'sticky top-0 z-30' : ''} bg-white dark:bg-slate-950 flex flex-col -mb-px`}>
+
+                                                    {/* File Name Header Block - Dual-axis sticky layout constraint */}
+                                                    {/* ИСПРАВЛЕНИЕ: w-full заменено на w-max min-w-full для предотвращения обрезки фона справа */}
+                                                    <div className="bg-blue-50 dark:bg-blue-950 border-b border-blue-200 dark:border-blue-900/50 select-none py-1.5 h-8 w-max min-w-full relative">
+                                                        {/* Текст обернут в sticky left-0, чтобы имя файла не улетало влево при горизонтальном скролле */}
+                                                        <span className="sticky left-0 px-4 text-xs font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950 z-10 py-1">
+                                                            FILE [{fileIdx + 1}/{dataSets.length}]: {dataset.fileName}
+                                                        </span>
+                                                        <span className="absolute right-4 text-[10px] uppercase opacity-50 tracking-wider font-semibold top-2 text-blue-700 dark:text-blue-400">
+                                                            Merged Block
+                                                        </span>
+                                                    </div>
+
+                                                    {/* Data Column Headers Row Container */}
+                                                    {/* ИСПРАВЛЕНИЕ: Добавлен pt-[9px] для бесшовной компенсации нахлеста */}
+                                                    <div className="flex bg-slate-100 dark:bg-slate-800 border-b border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-sm font-semibold pt-[9px]">
+                                                        {headers.map((header, i) => (
+                                                            <div
+                                                                key={i}
+                                                                className={`px-4 py-2 shrink-0 flex items-center justify-between gap-4 w-[180px] bg-slate-100 dark:bg-slate-800
+                                                                    ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 z-35 border-r border-slate-300 dark:border-slate-700 font-bold' : ''}`
+                                                                }
+                                                            >
+                                                                {editingHeaderIdx === i ? (
+                                                                    <div className="flex items-center gap-1 w-full">
+                                                                        <input
+                                                                            type="text"
+                                                                            value={editHeaderValue}
+                                                                            onChange={(e) => setEditHeaderValue(e.target.value)}
+                                                                            onBlur={() => saveHeaderName(i)}
+                                                                            onKeyDown={(e) => e.key === 'Enter' && saveHeaderName(i)}
+                                                                            className="bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 px-2 py-0.5 rounded border border-blue-500 focus:outline-none text-xs font-normal w-full"
+                                                                            autoFocus
+                                                                        />
+                                                                    </div>
+                                                                ) : (
+                                                                    <div className="flex items-center justify-between gap-2 w-full group/header">
+                                                                        <span>{header}</span>
+                                                                        <button
+                                                                            onClick={() => startEditingHeader(i, header)}
+                                                                            className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-0.5"
+                                                                            title="Rename Column Globally"
+                                                                        >
+                                                                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
+                                                                        </button>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+
+                                                {/* Text Rows Matrix Body Layer */}
+                                                <div className="divide-y divide-slate-200 dark:divide-slate-800 flex flex-col text-sm">
+                                                    {rows.map((row, rowIndex) => (
+                                                        <div key={rowIndex} className="flex hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
+                                                            {headers.map((_, colIndex) => {
+                                                                const cellValue = row[colIndex] || '';
+                                                                return (
+                                                                    <div
+                                                                        key={colIndex}
+                                                                        className={`px-4 py-2 shrink-0 w-[180px] text-slate-800 dark:text-slate-300 truncate
+                                                                            ${settings.firstColIsHeader && colIndex === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800 shadow-2xs' : ''}`
+                                                                        }
+                                                                    >
+                                                                        {cellValue}
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    ))}
+                                                    {rows.length === 0 && (
+                                                        <div className="px-4 py-8 text-center text-slate-500 w-full">
+                                                            No data rows successfully parsed within this file block.
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            ) : (
+                                /* =========================================================================
+                                   TAB VIEW: Classic single sheet isolated structure
+                                   ========================================================================= */
+                                <table className="w-full text-left border-collapse text-sm whitespace-nowrap">
+                                    <thead>
+                                    <tr className="text-slate-700 dark:text-slate-300">
+                                        {isolatedTable.headers.map((header, i) => (
+                                            <th
+                                                key={i}
+                                                className={`px-4 py-2 border-b border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 relative
+                                                    outline-1 outline-slate-100 dark:outline-slate-800
+                                                    ${settings.stickyHeaders ? 'sticky top-0 z-20' : ''}
+                                                    ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 border-r border-slate-300 dark:border-slate-700' : ''}
+                                                    ${settings.stickyHeaders && settings.firstColIsHeader && i === 0 ? 'z-30' : ''}`
+                                                }
+                                            >
+                                                {editingHeaderIdx === i ? (
+                                                    <div className="flex items-center gap-1">
+                                                        <input
+                                                            type="text"
+                                                            value={editHeaderValue}
+                                                            onChange={(e) => setEditHeaderValue(e.target.value)}
+                                                            onBlur={() => saveHeaderName(i)}
+                                                            onKeyDown={(e) => e.key === 'Enter' && saveHeaderName(i)}
+                                                            className="bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 px-2 py-1 rounded border border-blue-500 focus:outline-none text-xs font-normal"
+                                                            autoFocus
+                                                        />
+                                                    </div>
+                                                ) : (
+                                                    <div className="flex items-center justify-between gap-4 group/header">
+                                                        <span className="font-semibold">{header}</span>
+                                                        <button
+                                                            onClick={() => startEditingHeader(i, header)}
+                                                            className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-1"
+                                                            title="Rename Column"
+                                                        >
+                                                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
+                                                        </button>
+                                                    </div>
+                                                )}
+                                            </th>
+                                        ))}
                                     </tr>
-                                )}
-                                </tbody>
-                            </table>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                                    {isolatedTable.rows.map((row, rowIndex) => (
+                                        <tr key={rowIndex} className="hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
+                                            {isolatedTable.headers.map((_, colIndex) => {
+                                                const cellValue = row[colIndex] || '';
+                                                return (
+                                                    <td
+                                                        key={colIndex}
+                                                        className={`px-4 py-2 text-slate-800 dark:text-slate-300
+                                                            ${settings.firstColIsHeader && colIndex === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800' : ''}`
+                                                        }
+                                                    >
+                                                        {cellValue}
+                                                    </td>
+                                                );
+                                            })}
+                                        </tr>
+                                    ))}
+                                    {isolatedTable.rows.length === 0 && (
+                                        <tr>
+                                            <td colSpan={isolatedTable.headers.length || 1} className="px-4 py-8 text-center text-slate-500">
+                                                No table data successfully extracted. Check file structure.
+                                            </td>
+                                        </tr>
+                                    )}
+                                    </tbody>
+                                </table>
+                            )}
                         </div>
                     </div>
                 )}
