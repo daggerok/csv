@@ -75,6 +75,21 @@
  * - This eliminates the "spinner vanishes but UI is still frozen" gap that occurs
  *   when React needs 500ms–2s to reconcile thousands of table rows.
  *
+ * 7. [Layout-Heavy Settings Toggle Protection]
+ * - Certain settings changes cause massive DOM restructuring when data is loaded
+ *   (e.g. toggling Merge Files rebuilds the entire table from <table> to flex layout
+ *   or vice versa; toggling 1st Row = Header recomputes all rows).
+ * - These "expensive" toggles are intercepted by `updateSettingWithSpinner`, which:
+ *     a) Activates the rendering-phase spinner BEFORE committing the setting change.
+ *     b) Yields to main thread so the spinner paints.
+ *     c) Commits the setting via `setSettings`.
+ *     d) The existing `renderPhaseEffect` detects `phase === 'rendering'` and waits
+ *        for double-rAF paint confirmation before dismissing the overlay.
+ * - A configurable row threshold (`EXPENSIVE_TOGGLE_ROW_THRESHOLD`) determines when
+ *   the spinner protection is needed vs. when the change is fast enough to skip it.
+ * - Settings that DON'T cause layout restructuring (theme, stickyHeaders) bypass
+ *   this mechanism entirely and apply instantly.
+ *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
  * - Custom SVGs inline to avoid dependency bloat.
@@ -107,6 +122,9 @@ interface DataSet {
  *   idle → 'parsing' (files being read + parsed) → 'rendering' (data committed to
  *   React state, DOM reconciliation in progress) → idle (paint confirmed)
  *
+ * For settings toggles, the lifecycle is shorter:
+ *   idle → 'rendering' (setting committed, DOM restructuring) → idle (paint confirmed)
+ *
  * - `active`: Whether the loading overlay should be visible.
  * - `phase`: Current pipeline phase — drives spinner messaging.
  * - `current`: How many files have been fully processed so far (parse phase).
@@ -137,6 +155,25 @@ const DEFAULT_LOADING_STATE: LoadingState = {
     total: 0,
     fileName: '',
 };
+
+/**
+ * Minimum total row count across all loaded datasets before a setting toggle
+ * will trigger the spinner overlay. Below this threshold, the DOM reconciliation
+ * is fast enough that no spinner is needed. Tune based on target hardware.
+ */
+const EXPENSIVE_TOGGLE_ROW_THRESHOLD = 500;
+
+/**
+ * Set of setting keys that cause structural DOM changes (layout rebuild).
+ * These are the toggles that get routed through the spinner-protected path
+ * when sufficient data is loaded. Other keys (theme, stickyHeaders) are
+ * purely CSS changes and never need spinner protection.
+ */
+const LAYOUT_RESTRUCTURING_KEYS: Set<keyof AppSettings> = new Set([
+    'mergeFiles',
+    'firstRowIsHeader',
+    'firstColIsHeader',
+]);
 
 // Нативный компаратор для натуральной сортировки (например: file1, file2, file10)
 const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
@@ -262,16 +299,29 @@ function waitForPaint(): Promise<void> {
     });
 }
 
+/**
+ * Counts total data rows across all loaded datasets.
+ * Used to decide whether a settings toggle is "expensive" and needs spinner protection.
+ */
+function getTotalRowCount(dataSets: DataSet[]): number {
+    let total = 0;
+    for (const ds of dataSets) {
+        total += ds.data.length;
+    }
+    return total;
+}
+
 
 // --- SPINNER OVERLAY COMPONENT ---
 
 /**
- * Full-viewport loading overlay displayed during async CSV file processing.
+ * Full-viewport loading overlay displayed during async CSV file processing
+ * AND during expensive layout-restructuring settings toggles.
  *
  * Visual anatomy:
  * - Semi-transparent backdrop with blur to dim but not fully hide existing content.
  * - Animated conic-gradient spinner ring (CSS @keyframes spin via Tailwind `animate-spin`).
- * - Inner pulsing circle with a document SVG icon.
+ * - Inner pulsing circle with a document SVG icon (parse) or grid icon (render).
  * - Dynamic file counter badge: "Processing X of Y" (parse phase) or "Rendering…" (render phase).
  * - Current filename truncated to prevent layout overflow.
  * - Linear progress bar with animated width transitions.
@@ -363,7 +413,7 @@ const LoadingOverlay: React.FC<{ state: LoadingState }> = ({ state }) => {
                         />
                     </svg>
 
-                    {/* Inner icon — document with pulse (parse) or paint-brush (render) */}
+                    {/* Inner icon — document with pulse (parse) or grid/table (render) */}
                     <div className="relative z-10 flex items-center justify-center
                                     w-11 h-11 rounded-full
                                     bg-blue-50 dark:bg-blue-950/60
@@ -504,16 +554,14 @@ const App: React.FC = () => {
      * PHASE 2 PAINT DETECTION EFFECT
      *
      * When `loadingState.phase` transitions to `'rendering'`, React has already
-     * committed the new `dataSets` to state (triggered synchronously before this
-     * phase transition). This effect waits for the browser to fully paint the
-     * resulting DOM changes using double-rAF gating, then dismisses the spinner.
+     * committed the new state change (either `dataSets` from file import, or
+     * `settings` from a layout toggle). This effect waits for the browser to
+     * fully paint the resulting DOM changes using double-rAF gating, then
+     * dismisses the spinner.
      *
-     * Why useEffect and not inline in the async function?
-     * Because `setDataSets(...)` is asynchronous from React's perspective — the
-     * component re-renders with new data, but we need to wait for THAT render's
-     * paint, not just the current tick. `useEffect` fires after React has committed
-     * the render that includes the new table rows, making it the correct hook point
-     * to schedule paint detection from.
+     * This single effect handles BOTH:
+     * - File import pipeline (Phase 2 after parsing)
+     * - Settings toggle protection (mergeFiles, firstRowIsHeader, firstColIsHeader)
      */
     useEffect(() => {
         if (loadingState.phase !== 'rendering') return;
@@ -539,11 +587,72 @@ const App: React.FC = () => {
         return () => { cancelled = true; };
     }, [loadingState.phase]);
 
+    /**
+     * Instant setting update — used for settings that don't cause layout restructuring
+     * (e.g. theme, stickyHeaders). No spinner needed.
+     */
     const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
         setSettings(prev => ({ ...prev, [key]: value }));
     };
 
-    const handleResetSettings = () => setSettings(DEFAULT_SETTINGS);
+    /**
+     * Protected setting update with rendering spinner.
+     *
+     * For settings in `LAYOUT_RESTRUCTURING_KEYS` that would cause massive DOM
+     * reconciliation when data is loaded above `EXPENSIVE_TOGGLE_ROW_THRESHOLD`:
+     *
+     * 1. Show spinner in 'rendering' phase → yield so it paints
+     * 2. Commit the setting change (triggers expensive re-render)
+     * 3. The `renderPhaseEffect` detects `phase === 'rendering'` and waits for
+     *    double-rAF paint confirmation → dismisses spinner
+     *
+     * If data volume is below threshold, falls through to instant `updateSetting`.
+     */
+    const updateSettingWithSpinner = useCallback(async <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
+        const totalRows = getTotalRowCount(dataSets);
+        const isExpensive = LAYOUT_RESTRUCTURING_KEYS.has(key) && totalRows >= EXPENSIVE_TOGGLE_ROW_THRESHOLD;
+
+        if (!isExpensive) {
+            // Fast path — no spinner needed
+            setSettings(prev => ({ ...prev, [key]: value }));
+            return;
+        }
+
+        // Slow path — show rendering spinner before committing
+        setLoadingState({
+            active: true,
+            phase: 'rendering',
+            current: 0,
+            total: 0,
+            fileName: '',
+        });
+
+        // Yield so the spinner overlay mounts and paints BEFORE the heavy state change
+        await yieldToMain();
+
+        // Commit the setting — this triggers the expensive React reconciliation
+        setSettings(prev => ({ ...prev, [key]: value }));
+
+        // The useEffect watching `phase === 'rendering'` handles paint detection
+        // and auto-dismisses the spinner after the DOM settles.
+    }, [dataSets]);
+
+    const handleResetSettings = useCallback(async () => {
+        const totalRows = getTotalRowCount(dataSets);
+
+        if (totalRows >= EXPENSIVE_TOGGLE_ROW_THRESHOLD) {
+            setLoadingState({
+                active: true,
+                phase: 'rendering',
+                current: 0,
+                total: 0,
+                fileName: '',
+            });
+            await yieldToMain();
+        }
+
+        setSettings(DEFAULT_SETTINGS);
+    }, [dataSets]);
 
     const handleExportSettings = () => {
         const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' });
@@ -555,14 +664,27 @@ const App: React.FC = () => {
         URL.revokeObjectURL(url);
     };
 
-    const handleImportSettings = (e: ChangeEvent<HTMLInputElement>) => {
+    const handleImportSettings = useCallback(async (e: ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (!file) return;
         const reader = new FileReader();
-        reader.onload = (event) => {
+        reader.onload = async (event) => {
             try {
                 const imported = JSON.parse(event.target?.result as string);
                 if (imported && typeof imported === 'object') {
+                    const totalRows = getTotalRowCount(dataSets);
+
+                    if (totalRows >= EXPENSIVE_TOGGLE_ROW_THRESHOLD) {
+                        setLoadingState({
+                            active: true,
+                            phase: 'rendering',
+                            current: 0,
+                            total: 0,
+                            fileName: '',
+                        });
+                        await yieldToMain();
+                    }
+
                     setSettings({ ...DEFAULT_SETTINGS, ...imported });
                 }
             } catch (err) {
@@ -571,7 +693,7 @@ const App: React.FC = () => {
         };
         reader.readAsText(file);
         e.target.value = ''; // reset input
-    };
+    }, [dataSets]);
 
     const handleTriggerFileInput = () => {
         fileInputRef.current?.click();
@@ -742,17 +864,17 @@ const App: React.FC = () => {
                         </label>
 
                         <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
-                            <input type="checkbox" checked={settings.mergeFiles} onChange={(e) => updateSetting('mergeFiles', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
+                            <input type="checkbox" checked={settings.mergeFiles} onChange={(e) => updateSettingWithSpinner('mergeFiles', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
                             <span className="font-semibold text-blue-600 dark:text-blue-400">Merge Files</span>
                         </label>
 
                         <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
-                            <input type="checkbox" checked={settings.firstRowIsHeader} onChange={(e) => updateSetting('firstRowIsHeader', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
+                            <input type="checkbox" checked={settings.firstRowIsHeader} onChange={(e) => updateSettingWithSpinner('firstRowIsHeader', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
                             <span className="font-medium">1st Row = Header</span>
                         </label>
 
                         <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
-                            <input type="checkbox" checked={settings.firstColIsHeader} onChange={(e) => updateSetting('firstColIsHeader', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
+                            <input type="checkbox" checked={settings.firstColIsHeader} onChange={(e) => updateSettingWithSpinner('firstColIsHeader', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
                             <span className="font-medium">1st Col = Sticky</span>
                         </label>
 
