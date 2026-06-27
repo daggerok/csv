@@ -15,7 +15,7 @@
  * AGENTIC AI DOCUMENTATION & SYSTEM ARCHITECTURE
  * ============================================================================
  *
- * PROJECT: Fidelity CSV Data Viewer & Cleaner - Global Styles
+ * PROJECT: CSV Viewer — Global Styles
  * ENVIRONMENT: TailwindCSS v4 (CSS-in-JS style configuration)
  *
  * MODULES & FEATURES:
@@ -30,7 +30,7 @@
  * - `fade-in`: Entry transition for modal windows and popover elements.
  *
  * 3. [Utility Overrides]
- * - `.table-container`: Custom scrollbar styling to maintain UX consistency 
+ * - `.table-container`: Custom scrollbar styling to maintain UX consistency
  * across different OS platforms (Thin scrollbars for minimal visual footprint).
  *
  * DESIGN PATTERNS:
@@ -59,7 +59,7 @@
     }
 }
 
-/* Кастомные стили для скроллбара и фиксации колонок */
+/* Custom scrollbar styling and sticky column fixes */
 .table-container {
     scrollbar-width: thin;
     scrollbar-color: #cbd5e1 transparent;

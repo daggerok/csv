@@ -1,4 +1,4 @@
-# CSV Data Viewer [![CI](https://github.com/daggerok/csv/actions/workflows/ci.yaml/badge.svg)](https://github.com/daggerok/csv/actions/workflows/ci.yaml)
+# CSV Viewer [![CI](https://github.com/daggerok/csv/actions/workflows/ci.yaml/badge.svg)](https://github.com/daggerok/csv/actions/workflows/ci.yaml)
 A high-performance, single-file client-side React application designed to instantly parse, auto-clean, and visualize
 unstructured data tables extracted from raw Fidelity CSV exports. Built with **Bun**, **Vite**, **TypeScript**, and
 **TailwindCSS v4**.
@@ -49,8 +49,7 @@ Ensure you have [Bun](https://bun.sh/) installed locally on your development mac
 
 1. Clone the repository and navigate to the root directory:
    ```bash
-   git clone <your-repo-url>
-   cd fidelity-data-cleaner
+   git clone https://github.com/daggerok/csv.git && cd $_
    ```
 
 2. Install the necessary development dependencies:

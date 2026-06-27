@@ -1,7 +1,7 @@
 {
   "name": "csv",
   "version": "1.0.0",
-  "description": "CSV viewer",
+  "description": "CSV Viewer",
   "source": "src/index.html",
   "scripts": {
     "clean": "rimraf -rf dist",

@@ -16,7 +16,7 @@
  * AGENTIC AI DOCUMENTATION & SYSTEM ARCHITECTURE
  * ============================================================================
  *
- * PROJECT: Fidelity CSV Data Viewer & Cleaner
+ * PROJECT: CSV Viewer — Data Viewer & Cleaner
  * ENVIRONMENT: Bun, Vite, React, TypeScript, TailwindCSS v4
  *
  * MODULES & FEATURES:
@@ -32,11 +32,11 @@
  * including persistence of custom column headers, types, merge, and sticky toggles.
  *
  * 2. [Heuristic CSV Parser (`parseCSVRow` & `extractValidTableData`)]
- * - Fidelity CSVs contain unstructured preamble/postamble.
+ * - CSVs may contain unstructured preamble/postamble.
  * - The heuristic algorithm splits the file by lines, parses them properly
  * respecting double quotes, and counts columns.
  * - It isolates the longest contiguous block of rows that share the same
- * (or majority) column length, effectively stripping out legal text
+ * (or majority) column length, effectively stripping out non-tabular text
  * and account summaries.
  *
  * 3. [Dynamic Column Renaming & Custom Headers Registry]
@@ -142,10 +142,11 @@
  *   separate `'rendering'` phase useEffect for dismissal, because that effect
  *   is triggered by a state change and is subject to StrictMode double-invocation
  *   cancellation races.
- * - `isRestoringRef` is set to `true` SYNCHRONOUSLY during `useRef` initialization
- *   (not inside the async callback) when boot-restore is needed. This prevents
- *   the dataSets persistence useEffect from firing before the restore effect's
- *   first `await` and deleting the localStorage data it needs to read.
+ * - `NEEDS_BOOT_RESTORE` is a module-level constant evaluated once at load time.
+ * - `isRestoringRef` is initialized to `NEEDS_BOOT_RESTORE` value SYNCHRONOUSLY
+ *   during useRef initialization. This prevents the dataSets persistence useEffect
+ *   from firing before the restore effect's first `await` and deleting the
+ *   localStorage data it needs to read.
  * - Uses a monotonic `restoreRunIdRef` counter for StrictMode safety: each effect
  *   invocation gets a unique ID; stale runs self-abort at every async checkpoint.
  *
@@ -257,10 +258,10 @@ interface FilterExpression { orGroups: FilterCondition[][]; }
 // ============================================================================
 
 /** localStorage key for persisted app settings (theme, toggles, column overrides, etc.) */
-const LOCALSTORAGE_SETTINGS_KEY = 'fidelityApp_settings';
+const LOCALSTORAGE_SETTINGS_KEY = 'csvViewer_settings';
 
 /** localStorage key for persisted dataset content (when rememberData is enabled) */
-const LOCALSTORAGE_DATA_KEY = 'fidelityApp_datasets';
+const LOCALSTORAGE_DATA_KEY = 'csvViewer_datasets';
 
 /**
  * Maximum allowed size in megabytes for persisted dataset JSON in localStorage.
@@ -276,7 +277,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     firstColIsHeader: true,
     mergeFiles: false,
     stickyHeaders: true,
-    rememberData: false, // DISABLED BY DEFAULT — opt-in to avoid unexpected storage usage
+    rememberData: true, // DISABLED BY DEFAULT — opt-in to avoid unexpected storage usage
     columnCustomNames: {},
     columnTypeOverrides: {},
 };
@@ -857,25 +858,21 @@ const App: React.FC = () => {
     const [editHeaderValue, setEditHeaderValue] = useState<string>('');
     const [columnFilters, setColumnFilters] = useState<Record<number, string>>({});
 
-    /**
-     * Stable ref holding the rememberData flag from the synchronous settings init.
-     */
+    /** Stable ref holding the rememberData flag from the synchronous settings init. */
     const rememberDataRef = useRef<boolean>(settings.rememberData);
 
     /**
      * Flag set during the boot-restore cycle to suppress the dataSets persistence
      * useEffect from firing and deleting the localStorage data before it's been read.
      *
-     * CRITICAL: initialized to `true` when NEEDS_BOOT_RESTORE is true.
+     * CRITICAL: initialized to `NEEDS_BOOT_RESTORE` (true when restore is needed).
      * This prevents the persist effect from running on the very first render
      * (before the boot-restore effect has even had a chance to fire) and
      * clearing the localStorage data.
      */
     const isRestoringRef = useRef<boolean>(NEEDS_BOOT_RESTORE);
 
-    /**
-     * Monotonically increasing counter for StrictMode-safe boot-restore.
-     */
+    /** Monotonically increasing counter for StrictMode-safe boot-restore. */
     const restoreRunIdRef = useRef<number>(0);
 
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -895,7 +892,6 @@ const App: React.FC = () => {
             return;
         }
 
-        // Increment run ID and capture it for this closure
         restoreRunIdRef.current += 1;
         const myRunId = restoreRunIdRef.current;
         dbg(`BootRestore run #${myRunId} — starting`);
@@ -907,21 +903,17 @@ const App: React.FC = () => {
         };
 
         const restore = async () => {
-            // Step 1: Ensure spinner is active
             dbg(`BootRestore #${myRunId} step 1 — ensuring restoring spinner`);
             setLoadingState({ active: true, phase: 'restoring', current: 0, total: 0, fileName: '' });
 
-            // Step 2: Yield so React can flush spinner to DOM
             dbg(`BootRestore #${myRunId} step 2 — yieldToMain`);
             await yieldToMain(`restore#${myRunId}-flush`);
             if (isStale()) return;
 
-            // Step 3: Wait for browser to paint spinner
             dbg(`BootRestore #${myRunId} step 3 — waitForPaint`);
             await waitForPaint(`restore#${myRunId}-spinnerPaint`);
             if (isStale()) return;
 
-            // Step 4: Parse localStorage
             dbg(`BootRestore #${myRunId} step 4 — loadPersistedDataSets`);
             const restored = loadPersistedDataSets();
             dbg(`BootRestore #${myRunId} step 4 result`, {
@@ -939,33 +931,27 @@ const App: React.FC = () => {
                 return;
             }
 
-            // Step 5: Commit data
             dbg(`BootRestore #${myRunId} step 5 — setDataSets (${restored.length} datasets)`);
             setDataSets(restored);
 
-            // Step 6: Yield for React re-render
             dbg(`BootRestore #${myRunId} step 6 — yieldToMain (React re-render)`);
             await yieldToMain(`restore#${myRunId}-rerender`);
             if (isStale()) { isRestoringRef.current = false; return; }
 
-            // Step 7: Wait for paint pass 1
             dbg(`BootRestore #${myRunId} step 7 — waitForPaint pass 1`);
             await waitForPaint(`restore#${myRunId}-paint1`);
             if (isStale()) { isRestoringRef.current = false; return; }
 
-            // Step 8: Wait for paint pass 2
             dbg(`BootRestore #${myRunId} step 8 — waitForPaint pass 2`);
             await waitForPaint(`restore#${myRunId}-paint2`);
             if (isStale()) { isRestoringRef.current = false; return; }
 
-            // Step 9: Extra yield + paint for very large merge tables
             dbg(`BootRestore #${myRunId} step 9 — final yieldToMain + waitForPaint`);
             await yieldToMain(`restore#${myRunId}-final`);
             if (isStale()) { isRestoringRef.current = false; return; }
             await waitForPaint(`restore#${myRunId}-paint3`);
             if (isStale()) { isRestoringRef.current = false; return; }
 
-            // Step 10: Dismiss spinner
             dbg(`BootRestore #${myRunId} step 10 — dismissing spinner`);
             setLoadingState(DEFAULT_LOADING_STATE);
             isRestoringRef.current = false;
@@ -980,7 +966,6 @@ const App: React.FC = () => {
             }
         });
 
-        // No cleanup needed — stale-ID pattern handles everything
         return undefined;
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
@@ -994,8 +979,6 @@ const App: React.FC = () => {
 
     // --- Persist datasets when rememberData is enabled ---
     useEffect(() => {
-        // Skip writes during the boot-restore cycle to prevent clearing
-        // localStorage before the restore effect has read the data.
         if (isRestoringRef.current) {
             dbg('PersistEffect — SKIPPED (isRestoring is true)');
             return;
@@ -1086,7 +1069,7 @@ const App: React.FC = () => {
         const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = url; a.download = 'fidelity_settings.json'; a.click();
+        a.href = url; a.download = 'csv_viewer_settings.json'; a.click();
         URL.revokeObjectURL(url);
     };
 
@@ -1231,7 +1214,7 @@ const App: React.FC = () => {
                 <header className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-4 py-3 flex flex-col sm:flex-row justify-between items-center gap-4 z-40 shadow-xs shrink-0">
                     <div className="flex items-center gap-2">
                         <svg className="w-6 h-6 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                        <h1 className="text-xl font-bold tracking-tight">Fidelity Data Cleaner</h1>
+                        <h1 className="text-xl font-bold tracking-tight">CSV Viewer</h1>
                     </div>
                     <div className="flex flex-wrap items-center gap-3 text-sm">
                         <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
@@ -1281,7 +1264,7 @@ const App: React.FC = () => {
                         <div onClick={handleTriggerFileInput} className="flex-1 flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl bg-slate-50/50 dark:bg-slate-900/50 cursor-pointer group hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50/20 dark:hover:bg-blue-950/10 transition-all duration-200">
                             <svg className="w-16 h-16 mb-4 opacity-50 group-hover:opacity-80 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-all duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
                             <p className="text-lg font-medium group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">No CSV files loaded</p>
-                            <p className="text-sm opacity-80 group-hover:opacity-100 transition-opacity">Upload raw Fidelity files, the app will auto-clean them.</p>
+                            <p className="text-sm opacity-80 group-hover:opacity-100 transition-opacity">Upload CSV files to view and clean the data.</p>
                         </div>
                     ) : dataSets.length > 0 ? (
                         <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
