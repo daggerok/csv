@@ -38,9 +38,11 @@
  *
  * 3. [Dynamic Column Renaming & Custom Headers Registry]
  * - Allows inline editing of table headers using a pencil button.
+ * - Tracks the explicitly clicked header via a composite key (`fileIndex-colIndex`) to
+ *   prevent focus-stealing, immediate unmount loops, and layout jumps during multi-file Merge View.
  * - Custom names are stored inside `settings.columnCustomNames` mapped by index.
  * - Works universally: if a file has no header row, user-defined names are preserved
- * and injected seamlessly across file reloads.
+ *   and injected seamlessly across file reloads.
  *
  * 4. [Multi-File Merging & Flex/Grid Cross-Axis Sticky Layout Engine]
  * - Toggleable `mergeFiles` strategy inside app settings layout.
@@ -191,7 +193,8 @@ const App: React.FC = () => {
     const [activeTab, setActiveTab] = useState<number>(0);
 
     // UI Local State for inline renaming
-    const [editingHeaderIdx, setEditingHeaderIdx] = useState<number | null>(null);
+    // Updated to track composite string keys (fileIdx-colIdx) to prevent focus stealing in Merge Mode
+    const [editingHeaderKey, setEditingHeaderKey] = useState<string | null>(null);
     const [editHeaderValue, setEditHeaderValue] = useState<string>('');
 
     // DOM references for unified file triggers
@@ -284,22 +287,22 @@ const App: React.FC = () => {
     };
 
     // --- INLINE EDITING FUNCTIONS ---
-    const startEditingHeader = (index: number, currentValue: string) => {
-        setEditingHeaderIdx(index);
+    const startEditingHeader = (fileIndex: number, colIndex: number, currentValue: string) => {
+        setEditingHeaderKey(`${fileIndex}-${colIndex}`);
         setEditHeaderValue(currentValue);
     };
 
-    const saveHeaderName = (index: number) => {
+    const saveHeaderName = (colIndex: number) => {
         if (editHeaderValue.trim() !== '') {
             setSettings(prev => ({
                 ...prev,
                 columnCustomNames: {
                     ...prev.columnCustomNames,
-                    [index]: editHeaderValue.trim()
+                    [colIndex]: editHeaderValue.trim()
                 }
             }));
         }
-        setEditingHeaderIdx(null);
+        setEditingHeaderKey(null);
     };
 
     // --- DATA TRANSFORMATION SUB-ROUTINE ---
@@ -451,13 +454,10 @@ const App: React.FC = () => {
                                             <div key={fileIdx} className="relative border-b border-slate-200 dark:border-slate-800 last:border-none bg-white dark:bg-slate-950 flex flex-col w-full">
 
                                                 {/* Sticky Header Wrapper Context - Houses name and tags without physical DOM breaks */}
-                                                {/* ИСПРАВЛЕНИЕ: -mb-px намертво склеивает плашку с контентом снизу */}
                                                 <div className={`${settings.stickyHeaders ? 'sticky top-0 z-30' : ''} bg-white dark:bg-slate-950 flex flex-col -mb-px`}>
 
                                                     {/* File Name Header Block - Dual-axis sticky layout constraint */}
-                                                    {/* ИСПРАВЛЕНИЕ: w-full заменено на w-max min-w-full для предотвращения обрезки фона справа */}
                                                     <div className="bg-blue-50 dark:bg-blue-950 border-b border-blue-200 dark:border-blue-900/50 select-none py-1.5 h-8 w-max min-w-full relative">
-                                                        {/* Текст обернут в sticky left-0, чтобы имя файла не улетало влево при горизонтальном скролле */}
                                                         <span className="sticky left-0 px-4 text-xs font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950 z-10 py-1">
                                                             FILE [{fileIdx + 1}/{dataSets.length}]: {dataset.fileName}
                                                         </span>
@@ -467,7 +467,6 @@ const App: React.FC = () => {
                                                     </div>
 
                                                     {/* Data Column Headers Row Container */}
-                                                    {/* ИСПРАВЛЕНИЕ: Добавлен pt-[9px] для бесшовной компенсации нахлеста */}
                                                     <div className="flex bg-slate-100 dark:bg-slate-800 border-b border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-sm font-semibold pt-[9px]">
                                                         {headers.map((header, i) => (
                                                             <div
@@ -476,7 +475,7 @@ const App: React.FC = () => {
                                                                     ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 z-35 border-r border-slate-300 dark:border-slate-700 font-bold' : ''}`
                                                                 }
                                                             >
-                                                                {editingHeaderIdx === i ? (
+                                                                {editingHeaderKey === `${fileIdx}-${i}` ? (
                                                                     <div className="flex items-center gap-1 w-full">
                                                                         <input
                                                                             type="text"
@@ -492,7 +491,7 @@ const App: React.FC = () => {
                                                                     <div className="flex items-center justify-between gap-2 w-full group/header">
                                                                         <span>{header}</span>
                                                                         <button
-                                                                            onClick={() => startEditingHeader(i, header)}
+                                                                            onClick={() => startEditingHeader(fileIdx, i, header)}
                                                                             className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-0.5"
                                                                             title="Rename Column Globally"
                                                                         >
@@ -551,7 +550,7 @@ const App: React.FC = () => {
                                                     ${settings.stickyHeaders && settings.firstColIsHeader && i === 0 ? 'z-30' : ''}`
                                                 }
                                             >
-                                                {editingHeaderIdx === i ? (
+                                                {editingHeaderKey === `${activeTab}-${i}` ? (
                                                     <div className="flex items-center gap-1">
                                                         <input
                                                             type="text"
@@ -567,7 +566,7 @@ const App: React.FC = () => {
                                                     <div className="flex items-center justify-between gap-4 group/header">
                                                         <span className="font-semibold">{header}</span>
                                                         <button
-                                                            onClick={() => startEditingHeader(i, header)}
+                                                            onClick={() => startEditingHeader(activeTab, i, header)}
                                                             className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-1"
                                                             title="Rename Column"
                                                         >
