@@ -1507,7 +1507,7 @@ const App: React.FC = () => {
                     ) : dataSets.length > 0 ? (
                         <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
                             {!settings.mergeFiles && (
-                                <div className="flex overflow-x-auto border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 px-2 py-2 gap-2 hide-scrollbar shrink-0">
+                                <div className="flex overflow-x-auto border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 px-2 py-2 gap-2 themed-scroll shrink-0">
                                     {dataSets.map((ds, idx) => (
                                         <button key={idx} onClick={() => setActiveTab(idx)} className={`px-4 py-2 rounded-md text-sm font-semibold whitespace-nowrap transition-colors ${activeTab === idx ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50'}`}>{ds.fileName}</button>
                                     ))}
