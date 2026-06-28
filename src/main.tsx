@@ -23,13 +23,14 @@
  * 1. [Types & State Management]
  * - `AppSettings`: Stores UI/UX settings (theme, header configurations,
  * multi-file merge state, custom column name mappings, column type overrides,
- * rememberData flag, and structural sticky flags).
+ * rememberData flag, structural sticky flags, and persisted column filters).
  * - `DataSet`: Represents a parsed CSV file with cleaned table rows.
  * - `SortState`: Tracks current sort column index and direction (asc/desc/null).
  * - Settings are initialized SYNCHRONOUSLY from `localStorage` to prevent
  * race conditions and theme flickering during development/strict mode.
  * - Export/Import settings to JSON allows multi-project configurations,
- * including persistence of custom column headers, types, merge, and sticky toggles.
+ * including persistence of custom column headers, types, merge, sticky toggles,
+ * and column filters.
  *
  * 2. [Heuristic CSV Parser (`parseCSVRow` & `extractValidTableData`)]
  * - CSVs may contain unstructured preamble/postamble.
@@ -117,6 +118,13 @@
  *   expensive re-filtering on every keystroke while keeping the input responsive.
  *   Clearing the filter (via ✗ button) bypasses the debounce and applies immediately.
  *
+ * - FILTER PERSISTENCE: Column filters are stored in `settings.columnFilters`
+ *   (Record<number, string>) and persisted to localStorage alongside all other
+ *   settings. On app boot / settings restore, filters are rehydrated from the
+ *   saved settings. The local `columnFilters` state is initialized from settings
+ *   and synced back on every change. Reset Settings and Clear All Filters both
+ *   clear persisted filters.
+ *
  * 10. [Remember Data — LocalStorage Persistence for Imported Datasets]
  * - Toggleable via `settings.rememberData` checkbox in the header settings bar.
  * - When ENABLED:
@@ -156,6 +164,18 @@
  *   yieldToMain, and waitForPaint utility functions.
  * - All debug logs are prefixed with `[DBG]` for easy filtering.
  * - When `?debug=true` is not present, all debug logging is completely inert (no-op).
+ *
+ * 13. [Export CSV Files]
+ * - Exports the currently visible (sorted + filtered) data as CSV files.
+ * - In Tab View: Exports the active tab's visible data as a single CSV file.
+ * - In Merge View: Exports each file's visible data as separate CSV downloads.
+ * - Exported CSV includes:
+ *     a) Custom column headers (if renamed) or original/default headers.
+ *     b) Only the rows that pass current filters and sort order.
+ * - CSV encoding properly escapes fields containing commas, quotes, or newlines
+ *   using RFC 4180 compliant double-quote wrapping.
+ * - File naming: uses original filename with `_exported` suffix, or
+ *   `exported_data.csv` for files without a `.csv` extension.
  *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
@@ -224,6 +244,8 @@ interface AppSettings {
     rememberData: boolean; // Persist imported datasets to localStorage across reloads
     columnCustomNames: Record<number, string>;
     columnTypeOverrides: Record<number, ColumnType>;
+    /** Persisted column filter expressions, keyed by column index */
+    columnFilters: Record<number, string>;
 }
 
 interface DataSet { fileName: string; data: string[][]; }
@@ -257,7 +279,7 @@ interface FilterExpression { orGroups: FilterCondition[][]; }
 // CONSTANTS
 // ============================================================================
 
-/** localStorage key for persisted app settings (theme, toggles, column overrides, etc.) */
+/** localStorage key for persisted app settings (theme, toggles, column overrides, filters, etc.) */
 const LOCALSTORAGE_SETTINGS_KEY = 'csvViewer_settings';
 
 /** localStorage key for persisted dataset content (when rememberData is enabled) */
@@ -280,6 +302,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     rememberData: true, // DISABLED BY DEFAULT — opt-in to avoid unexpected storage usage
     columnCustomNames: {},
     columnTypeOverrides: {},
+    columnFilters: {},
 };
 
 const DEFAULT_LOADING_STATE: LoadingState = { active: false, phase: 'idle', current: 0, total: 0, fileName: '' };
@@ -533,6 +556,61 @@ function applyFilters(rows: string[][], filters: Record<number, string>, getColT
     }
     if (parsed.length === 0) return rows;
     return rows.filter(row => parsed.every(({ colIndex, expression, colType }) => matchesFilter(row[colIndex] || '', expression, colType)));
+}
+
+// ============================================================================
+// CSV EXPORT HELPERS
+// ============================================================================
+
+/**
+ * Escapes a single CSV field according to RFC 4180.
+ * Wraps the field in double quotes if it contains commas, quotes, or newlines.
+ * Internal double quotes are escaped by doubling them ("").
+ */
+function escapeCSVField(field: string): string {
+    if (field.includes('"') || field.includes(',') || field.includes('\n') || field.includes('\r')) {
+        return '"' + field.replace(/"/g, '""') + '"';
+    }
+    return field;
+}
+
+/**
+ * Converts headers and rows into a CSV string.
+ */
+function buildCSVString(headers: string[], rows: string[][]): string {
+    const lines: string[] = [];
+    lines.push(headers.map(escapeCSVField).join(','));
+    for (const row of rows) {
+        lines.push(row.map(cell => escapeCSVField(cell || '')).join(','));
+    }
+    return lines.join('\r\n');
+}
+
+/**
+ * Triggers a browser download of the given content as a file.
+ */
+function downloadFile(content: string, fileName: string, mimeType: string = 'text/csv;charset=utf-8;'): void {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+/**
+ * Generates an export filename from the original filename.
+ * e.g., "data.csv" → "data_exported.csv", "report" → "report_exported.csv"
+ */
+function makeExportFileName(originalName: string): string {
+    const dotIndex = originalName.lastIndexOf('.');
+    if (dotIndex > 0) {
+        const base = originalName.substring(0, dotIndex);
+        const ext = originalName.substring(dotIndex);
+        return `${base}_exported${ext}`;
+    }
+    return `${originalName}_exported.csv`;
 }
 
 // ============================================================================
@@ -856,7 +934,14 @@ const App: React.FC = () => {
     const [sortState, setSortState] = useState<SortState>(DEFAULT_SORT_STATE);
     const [editingHeaderKey, setEditingHeaderKey] = useState<string | null>(null);
     const [editHeaderValue, setEditHeaderValue] = useState<string>('');
-    const [columnFilters, setColumnFilters] = useState<Record<number, string>>({});
+
+    /**
+     * Column filters state — initialized from persisted settings.
+     * This allows filters to survive page reloads when settings are saved.
+     */
+    const [columnFilters, setColumnFilters] = useState<Record<number, string>>(() => {
+        return settings.columnFilters || {};
+    });
 
     /** Stable ref holding the rememberData flag from the synchronous settings init. */
     const rememberDataRef = useRef<boolean>(settings.rememberData);
@@ -977,6 +1062,20 @@ const App: React.FC = () => {
         else document.documentElement.classList.remove('dark');
     }, [settings]);
 
+    // --- Sync columnFilters into settings for persistence ---
+    useEffect(() => {
+        setSettings(prev => {
+            /** Only update if the filters actually changed to avoid infinite loops */
+            const prevFilters = prev.columnFilters || {};
+            const prevKeys = Object.keys(prevFilters);
+            const nextKeys = Object.keys(columnFilters);
+            if (prevKeys.length === nextKeys.length && nextKeys.every(k => prevFilters[parseInt(k, 10)] === columnFilters[parseInt(k, 10)])) {
+                return prev;
+            }
+            return { ...prev, columnFilters };
+        });
+    }, [columnFilters]);
+
     // --- Persist datasets when rememberData is enabled ---
     useEffect(() => {
         if (isRestoringRef.current) {
@@ -1017,10 +1116,9 @@ const App: React.FC = () => {
         };
     }, [loadingState.phase]);
 
-    // --- Reset sort and filters on tab/merge change ---
+    // --- Reset sort on tab/merge change (filters are preserved since they're persisted) ---
     useEffect(() => {
         setSortState(DEFAULT_SORT_STATE);
-        setColumnFilters({});
     }, [activeTab, settings.mergeFiles]);
 
     const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
@@ -1087,6 +1185,8 @@ const App: React.FC = () => {
                     const newSettings = { ...DEFAULT_SETTINGS, ...imported };
                     rememberDataRef.current = newSettings.rememberData;
                     setSettings(newSettings);
+                    /** Restore persisted filters from imported settings */
+                    setColumnFilters(newSettings.columnFilters || {});
                     if (!newSettings.rememberData) clearPersistedDataSets();
                 }
             } catch { alert("Invalid JSON format"); }
@@ -1207,6 +1307,42 @@ const App: React.FC = () => {
 
     const hasActiveFilters = Object.keys(columnFilters).length > 0;
 
+    // -------------------------------------------------------------------------
+    // EXPORT CSV FILES
+    // -------------------------------------------------------------------------
+
+    /**
+     * Exports the currently visible (sorted + filtered) data as CSV files.
+     * - Tab View: exports the active tab's visible data as a single file.
+     * - Merge View: exports each file's visible data as separate downloads.
+     */
+    const handleExportCSV = useCallback(() => {
+        if (dataSets.length === 0) return;
+
+        if (settings.mergeFiles) {
+            /** Merge View: export each file separately with its visible rows */
+            for (const dataset of dataSets) {
+                const { headers, rows } = getFileHeadersAndRows(dataset.data);
+                const dataRows = settings.firstRowIsHeader ? dataset.data.slice(1) : dataset.data;
+                const getColType = (i: number) => getColumnType(i, dataRows);
+                const filtered = applyFilters(rows, columnFilters, getColType);
+                const sorted = applySortToRows(filtered, dataRows);
+
+                if (sorted.length === 0 && !hasActiveFilters) continue; // Skip empty datasets only if no filters
+
+                const csvContent = buildCSVString(headers, sorted);
+                const exportName = makeExportFileName(dataset.fileName);
+                downloadFile(csvContent, exportName);
+            }
+        } else {
+            /** Tab View: export only the active tab's visible data */
+            const csvContent = buildCSVString(isolatedTable.headers, isolatedTable.rows);
+            const originalName = dataSets[activeTab]?.fileName || 'exported_data.csv';
+            const exportName = makeExportFileName(originalName);
+            downloadFile(csvContent, exportName);
+        }
+    }, [dataSets, settings.mergeFiles, settings.firstRowIsHeader, getFileHeadersAndRows, getColumnType, columnFilters, applySortToRows, hasActiveFilters, isolatedTable, activeTab]);
+
     return (
         <>
             <LoadingOverlay state={loadingState} />
@@ -1249,7 +1385,15 @@ const App: React.FC = () => {
                     <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-slate-950 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm shrink-0">
                         <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
                             <button onClick={handleTriggerFileInput} disabled={loadingState.active} className="cursor-pointer bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm">Import CSV Files</button>
-                            {dataSets.length > 0 && <button onClick={handleClearData} disabled={loadingState.active} className="text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 rounded-lg font-semibold transition-colors">Clear Data</button>}
+                            {dataSets.length > 0 && (
+                                <>
+                                    <button onClick={handleExportCSV} disabled={loadingState.active} className="cursor-pointer bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm flex items-center gap-2 justify-center" title={settings.mergeFiles ? 'Export all files with current sort & filters applied' : 'Export current tab with sort & filters applied'}>
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                        Export CSV{settings.mergeFiles ? ' Files' : ''}
+                                    </button>
+                                    <button onClick={handleClearData} disabled={loadingState.active} className="text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 rounded-lg font-semibold transition-colors">Clear Data</button>
+                                </>
+                            )}
                         </div>
                         <div className="flex flex-wrap items-center gap-2 text-sm w-full md:w-auto">
                             <span className="text-slate-500 dark:text-slate-400 mr-2 font-medium">Config:</span>

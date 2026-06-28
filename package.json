@@ -5,6 +5,7 @@
   "source": "src/index.html",
   "scripts": {
     "clean": "rimraf -rf dist",
+    "preserve": "npm run clean",
     "prebuild": "npm run clean",
     "build-github-pages": "npm run build -- --public-url=/csv/",
     "serve": "parcel --no-cache --no-source-maps",
