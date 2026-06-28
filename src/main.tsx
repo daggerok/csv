@@ -165,17 +165,28 @@
  * - All debug logs are prefixed with `[DBG]` for easy filtering.
  * - When `?debug=true` is not present, all debug logging is completely inert (no-op).
  *
- * 13. [Export CSV Files]
- * - Exports the currently visible (sorted + filtered) data as CSV files.
- * - In Tab View: Exports the active tab's visible data as a single CSV file.
- * - In Merge View: Exports each file's visible data as separate CSV downloads.
- * - Exported CSV includes:
- *     a) Custom column headers (if renamed) or original/default headers.
- *     b) Only the rows that pass current filters and sort order.
- * - CSV encoding properly escapes fields containing commas, quotes, or newlines
- *   using RFC 4180 compliant double-quote wrapping.
- * - File naming: uses original filename with `_exported` suffix, or
- *   `exported_data.csv` for files without a `.csv` extension.
+ * 13. [CSV Export — Three Modes]
+ * - Mode depends on `settings.mergeFiles`:
+ *
+ *   A) Merge Files OFF — single button: "Export CSV"
+ *      → `handleExportTabCSV` exports only the currently visible tab,
+ *        using sort + filter state already applied via `isolatedTable`.
+ *
+ *   B) Merge Files ON — two buttons rendered side-by-side:
+ *      B1) "Export Merged CSV" → `handleExportMergedCSV`
+ *          Produces ONE combined CSV. Each dataset block is preceded by
+ *          a `FILE: <filename>` separator row, followed by its column
+ *          headers and visible (sort+filter applied) rows. All rows are
+ *          padded to the global max column width so the output remains
+ *          a rectangular CSV (RFC 4180 friendly).
+ *      B2) "Export All CSV Files" → `handleExportAllCSVFiles`
+ *          Triggers one browser download per dataset. Each file contains
+ *          its own header row + sort+filtered rows. Filenames use
+ *          `<original>_exported.csv` via `makeExportFileName`.
+ *
+ * - All exported CSV content is RFC 4180 encoded via `escapeCSVField`,
+ *   wrapping any field containing commas, quotes, or newlines in double
+ *   quotes and escaping internal quotes by doubling them.
  *
  * DESIGN PATTERNS:
  * - Single File Application: Everything is self-contained for easy maintenance.
@@ -1357,84 +1368,97 @@ const App: React.FC = () => {
     const hasActiveFilters = Object.keys(columnFilters).length > 0;
 
     // -------------------------------------------------------------------------
-    // EXPORT CSV FILES
+    // EXPORT CSV — three modes:
+    //   1. handleExportTabCSV       → Tab View only: export active tab with sort+filter applied.
+    //   2. handleExportMergedCSV    → Merge View: export ONE combined CSV with filename separator rows.
+    //   3. handleExportAllCSVFiles  → Merge View: export each dataset as a SEPARATE CSV download,
+    //                                  each with current sort+filter applied.
     // -------------------------------------------------------------------------
 
     /**
-     * Exports the currently visible (sorted + filtered) data as CSV files.
-     * - Tab View: exports the active tab's visible data as a single file.
-     * - Merge View enabled: exports all files visible data as a single file.
-     * - Merge View disabled: exports each file's visible data as separate downloads.
+     * Tab View export — exports only the currently visible tab.
+     * Uses the memoized `isolatedTable` which already has sort + filter applied.
      */
-    const handleExportCSV = useCallback(() => {
+    const handleExportTabCSV = useCallback(() => {
         if (dataSets.length === 0) return;
-
-        if (settings.mergeFiles) {
-            /**
-             * Merge View:
-             * Export EVERYTHING into a SINGLE CSV file.
-             * Each dataset block is separated by one filename row, followed by that file's headers and rows.
-             */
-            const blocks = dataSets.map(dataset => {
-                const { headers, rows } = getFileHeadersAndRows(dataset.data);
-                const dataRows = settings.firstRowIsHeader ? dataset.data.slice(1) : dataset.data;
-                const getColType = (i: number) => getColumnType(i, dataRows);
-                const filtered = applyFilters(rows, columnFilters, getColType);
-                const sorted = applySortToRows(filtered, dataRows);
-
-                return {
-                    fileName: dataset.fileName,
-                    headers,
-                    rows: sorted,
-                };
-            });
-
-            const maxCols = Math.max(
-                1,
-                ...blocks.map(block => Math.max(
-                    block.headers.length,
-                    ...block.rows.map(r => r.length),
-                    1
-                ))
-            );
-
-            const mergedRows: string[][] = [];
-
-            for (const block of blocks) {
-                mergedRows.push(padCSVRow([block.fileName], maxCols));
-
-                if (block.headers.length > 0) {
-                    mergedRows.push(padCSVRow(block.headers, maxCols));
-                }
-
-                for (const row of block.rows) {
-                    mergedRows.push(padCSVRow(row, maxCols));
-                }
-            }
-
-            const csvContent = buildCSVStringFromRows(mergedRows);
-            downloadFile(csvContent, 'merged_exported.csv');
-            return;
-        }
-
-        /**
-         * Tab View:
-         * Export only the currently visible tab with current sort + filters applied.
-         */
         const csvContent = buildCSVString(isolatedTable.headers, isolatedTable.rows);
         const originalName = dataSets[activeTab]?.fileName || 'exported_data.csv';
         const exportName = makeExportFileName(originalName);
         downloadFile(csvContent, exportName);
+    }, [dataSets, isolatedTable, activeTab]);
+
+    /**
+     * Merge View — single combined CSV export.
+     * Each dataset block is preceded by a single `FILE: <filename>` separator row,
+     * followed by that file's column headers and visible (sorted + filtered) rows.
+     * All rows are padded to the max column width across all blocks so the output
+     * remains a rectangular CSV.
+     */
+    const handleExportMergedCSV = useCallback(() => {
+        if (dataSets.length === 0) return;
+
+        const blocks = dataSets.map(dataset => {
+            const { headers, rows } = getFileHeadersAndRows(dataset.data);
+            const dataRows = settings.firstRowIsHeader ? dataset.data.slice(1) : dataset.data;
+            const getColType = (i: number) => getColumnType(i, dataRows);
+            const filtered = applyFilters(rows, columnFilters, getColType);
+            const sorted = applySortToRows(filtered, dataRows);
+            return { fileName: dataset.fileName, headers, rows: sorted };
+        });
+
+        const maxCols = Math.max(
+            1,
+            ...blocks.map(block => Math.max(
+                block.headers.length,
+                ...block.rows.map(r => r.length),
+                1
+            ))
+        );
+
+        const mergedRows: string[][] = [];
+        for (const block of blocks) {
+            mergedRows.push(padCSVRow([`FILE: ${block.fileName}`], maxCols));
+            if (block.headers.length > 0) mergedRows.push(padCSVRow(block.headers, maxCols));
+            for (const row of block.rows) mergedRows.push(padCSVRow(row, maxCols));
+        }
+
+        const csvContent = buildCSVStringFromRows(mergedRows);
+        downloadFile(csvContent, 'merged_exported.csv');
     }, [
         dataSets,
-        settings.mergeFiles,
         settings.firstRowIsHeader,
         getFileHeadersAndRows,
         getColumnType,
         columnFilters,
         applySortToRows,
-        isolatedTable,
-        activeTab,
+    ]);
+
+    /**
+     * Merge View — exports each dataset as its own SEPARATE CSV file.
+     * Triggers one browser download per dataset, each containing the current
+     * sort + filter results for that file. Filenames use `<original>_exported.csv`.
+     */
+    const handleExportAllCSVFiles = useCallback(() => {
+        if (dataSets.length === 0) return;
+
+        for (const dataset of dataSets) {
+            const { headers, rows } = getFileHeadersAndRows(dataset.data);
+            const dataRows = settings.firstRowIsHeader ? dataset.data.slice(1) : dataset.data;
+            const getColType = (i: number) => getColumnType(i, dataRows);
+            const filtered = applyFilters(rows, columnFilters, getColType);
+            const sorted = applySortToRows(filtered, dataRows);
+
+            const csvContent = buildCSVString(headers, sorted);
+            const exportName = makeExportFileName(dataset.fileName);
+            downloadFile(csvContent, exportName);
+        }
+    }, [
+        dataSets,
+        settings.firstRowIsHeader,
+        getFileHeadersAndRows,
+        getColumnType,
+        columnFilters,
+        applySortToRows,
     ]);
 
     return (
@@ -1481,11 +1505,51 @@ const App: React.FC = () => {
                             <button onClick={handleTriggerFileInput} disabled={loadingState.active} className="cursor-pointer bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm">Import CSV Files</button>
                             {dataSets.length > 0 && (
                                 <>
-                                    <button onClick={handleExportCSV} disabled={loadingState.active} className="cursor-pointer bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm flex items-center gap-2 justify-center" title={settings.mergeFiles ? 'Export all files with current sort & filters applied' : 'Export current tab with sort & filters applied'}>
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                        Export CSV{settings.mergeFiles ? ' Files' : ''}
+                                    {settings.mergeFiles ? (
+                                        <>
+                                            <button
+                                                onClick={handleExportMergedCSV}
+                                                disabled={loadingState.active}
+                                                className="cursor-pointer bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm flex items-center gap-2 justify-center"
+                                                title="Export all visible data as ONE merged CSV file (filename separator rows between blocks)"
+                                            >
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                                </svg>
+                                                Export Merged CSV
+                                            </button>
+                                            <button
+                                                onClick={handleExportAllCSVFiles}
+                                                disabled={loadingState.active}
+                                                className="cursor-pointer bg-teal-600 hover:bg-teal-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm flex items-center gap-2 justify-center"
+                                                title="Export each file separately with current sort & filters applied (one download per file)"
+                                            >
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h9a2 2 0 002-2v-3m5-9l-7 7m0 0V6m0 7h7" />
+                                                </svg>
+                                                Export All CSV Files
+                                            </button>
+                                        </>
+                                    ) : (
+                                        <button
+                                            onClick={handleExportTabCSV}
+                                            disabled={loadingState.active}
+                                            className="cursor-pointer bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg font-semibold transition-colors text-center shadow-sm flex items-center gap-2 justify-center"
+                                            title="Export current tab with sort & filters applied"
+                                        >
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                            </svg>
+                                            Export CSV
+                                        </button>
+                                    )}
+                                    <button
+                                        onClick={handleClearData}
+                                        disabled={loadingState.active}
+                                        className="text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 rounded-lg font-semibold transition-colors"
+                                    >
+                                        Clear Data
                                     </button>
-                                    <button onClick={handleClearData} disabled={loadingState.active} className="text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 rounded-lg font-semibold transition-colors">Clear Data</button>
                                 </>
                             )}
                         </div>
