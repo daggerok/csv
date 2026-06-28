@@ -246,6 +246,8 @@ interface AppSettings {
     columnTypeOverrides: Record<number, ColumnType>;
     /** Persisted column filter expressions, keyed by column index */
     columnFilters: Record<number, string>;
+    /** Persisted global sort state */
+    sortState: SortState;
 }
 
 interface DataSet { fileName: string; data: string[][]; }
@@ -299,10 +301,11 @@ const DEFAULT_SETTINGS: AppSettings = {
     firstColIsHeader: true,
     mergeFiles: false,
     stickyHeaders: true,
-    rememberData: true, // DISABLED BY DEFAULT — opt-in to avoid unexpected storage usage
+    rememberData: true,
     columnCustomNames: {},
     columnTypeOverrides: {},
     columnFilters: {},
+    sortState: { columnIndex: null, direction: 'asc' },
 };
 
 const DEFAULT_LOADING_STATE: LoadingState = { active: false, phase: 'idle', current: 0, total: 0, fileName: '' };
@@ -904,7 +907,19 @@ const App: React.FC = () => {
     const [settings, setSettings] = useState<AppSettings>(() => {
         if (typeof window !== 'undefined') {
             const saved = localStorage.getItem(LOCALSTORAGE_SETTINGS_KEY);
-            if (saved) { try { return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) }; } catch { /* ignore */ } }
+            if (saved) {
+                try {
+                    const parsed = JSON.parse(saved);
+                    return {
+                        ...DEFAULT_SETTINGS,
+                        ...parsed,
+                        columnFilters: parsed.columnFilters || {},
+                        sortState: { ...DEFAULT_SORT_STATE, ...(parsed.sortState || {}) },
+                    };
+                } catch {
+                    /* ignore */
+                }
+            }
         }
         return DEFAULT_SETTINGS;
     });
@@ -931,7 +946,7 @@ const App: React.FC = () => {
         return DEFAULT_LOADING_STATE;
     });
 
-    const [sortState, setSortState] = useState<SortState>(DEFAULT_SORT_STATE);
+    const [sortState, setSortState] = useState<SortState>(() => settings.sortState || DEFAULT_SORT_STATE);
     const [editingHeaderKey, setEditingHeaderKey] = useState<string | null>(null);
     const [editHeaderValue, setEditHeaderValue] = useState<string>('');
 
@@ -942,6 +957,17 @@ const App: React.FC = () => {
     const [columnFilters, setColumnFilters] = useState<Record<number, string>>(() => {
         return settings.columnFilters || {};
     });
+
+    // --- Sync sortState into settings for persistence ---
+    useEffect(() => {
+        setSettings(prev => {
+            const prevSort = prev.sortState || DEFAULT_SORT_STATE;
+            if (prevSort.columnIndex === sortState.columnIndex && prevSort.direction === sortState.direction) {
+                return prev;
+            }
+            return { ...prev, sortState };
+        });
+    }, [sortState]);
 
     /** Stable ref holding the rememberData flag from the synchronous settings init. */
     const rememberDataRef = useRef<boolean>(settings.rememberData);
@@ -1116,11 +1142,6 @@ const App: React.FC = () => {
         };
     }, [loadingState.phase]);
 
-    // --- Reset sort on tab/merge change (filters are preserved since they're persisted) ---
-    useEffect(() => {
-        setSortState(DEFAULT_SORT_STATE);
-    }, [activeTab, settings.mergeFiles]);
-
     const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
         setSettings(prev => ({ ...prev, [key]: value }));
 
@@ -1182,11 +1203,19 @@ const App: React.FC = () => {
                         setLoadingState({ active: true, phase: 'rendering', current: 0, total: 0, fileName: '' });
                         await yieldToMain();
                     }
-                    const newSettings = { ...DEFAULT_SETTINGS, ...imported };
+
+                    const newSettings: AppSettings = {
+                        ...DEFAULT_SETTINGS,
+                        ...imported,
+                        columnFilters: imported.columnFilters || {},
+                        sortState: { ...DEFAULT_SORT_STATE, ...(imported.sortState || {}) },
+                    };
+
                     rememberDataRef.current = newSettings.rememberData;
                     setSettings(newSettings);
-                    /** Restore persisted filters from imported settings */
                     setColumnFilters(newSettings.columnFilters || {});
+                    setSortState(newSettings.sortState || DEFAULT_SORT_STATE);
+
                     if (!newSettings.rememberData) clearPersistedDataSets();
                 }
             } catch { alert("Invalid JSON format"); }
