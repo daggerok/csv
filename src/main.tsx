@@ -565,6 +565,26 @@ function applyFilters(rows: string[][], filters: Record<number, string>, getColT
 // CSV EXPORT HELPERS
 // ============================================================================
 
+function buildCSVLine(cells: string[]): string {
+    return cells.map(cell => escapeCSVField(cell || '')).join(',');
+}
+
+/**
+ * Converts arbitrary CSV rows into a CSV string without injecting a separate header row.
+ * Useful for merged exports where filename separator rows are part of the output.
+ */
+function buildCSVStringFromRows(rows: string[][]): string {
+    return rows.map(buildCSVLine).join('\r\n');
+}
+
+/**
+ * Pads a row to a uniform width so merged exports remain rectangular CSV data.
+ */
+function padCSVRow(row: string[], width: number): string[] {
+    if (row.length >= width) return row.slice(0, width);
+    return [...row, ...Array.from({ length: width - row.length }, () => '')];
+}
+
 /**
  * Escapes a single CSV field according to RFC 4180.
  * Wraps the field in double quotes if it contains commas, quotes, or newlines.
@@ -582,9 +602,9 @@ function escapeCSVField(field: string): string {
  */
 function buildCSVString(headers: string[], rows: string[][]): string {
     const lines: string[] = [];
-    lines.push(headers.map(escapeCSVField).join(','));
+    lines.push(buildCSVLine(headers));
     for (const row of rows) {
-        lines.push(row.map(cell => escapeCSVField(cell || '')).join(','));
+        lines.push(buildCSVLine(row));
     }
     return lines.join('\r\n');
 }
@@ -1343,34 +1363,79 @@ const App: React.FC = () => {
     /**
      * Exports the currently visible (sorted + filtered) data as CSV files.
      * - Tab View: exports the active tab's visible data as a single file.
-     * - Merge View: exports each file's visible data as separate downloads.
+     * - Merge View enabled: exports all files visible data as a single file.
+     * - Merge View disabled: exports each file's visible data as separate downloads.
      */
     const handleExportCSV = useCallback(() => {
         if (dataSets.length === 0) return;
 
         if (settings.mergeFiles) {
-            /** Merge View: export each file separately with its visible rows */
-            for (const dataset of dataSets) {
+            /**
+             * Merge View:
+             * Export EVERYTHING into a SINGLE CSV file.
+             * Each dataset block is separated by one filename row, followed by that file's headers and rows.
+             */
+            const blocks = dataSets.map(dataset => {
                 const { headers, rows } = getFileHeadersAndRows(dataset.data);
                 const dataRows = settings.firstRowIsHeader ? dataset.data.slice(1) : dataset.data;
                 const getColType = (i: number) => getColumnType(i, dataRows);
                 const filtered = applyFilters(rows, columnFilters, getColType);
                 const sorted = applySortToRows(filtered, dataRows);
 
-                if (sorted.length === 0 && !hasActiveFilters) continue; // Skip empty datasets only if no filters
+                return {
+                    fileName: dataset.fileName,
+                    headers,
+                    rows: sorted,
+                };
+            });
 
-                const csvContent = buildCSVString(headers, sorted);
-                const exportName = makeExportFileName(dataset.fileName);
-                downloadFile(csvContent, exportName);
+            const maxCols = Math.max(
+                1,
+                ...blocks.map(block => Math.max(
+                    block.headers.length,
+                    ...block.rows.map(r => r.length),
+                    1
+                ))
+            );
+
+            const mergedRows: string[][] = [];
+
+            for (const block of blocks) {
+                mergedRows.push(padCSVRow([block.fileName], maxCols));
+
+                if (block.headers.length > 0) {
+                    mergedRows.push(padCSVRow(block.headers, maxCols));
+                }
+
+                for (const row of block.rows) {
+                    mergedRows.push(padCSVRow(row, maxCols));
+                }
             }
-        } else {
-            /** Tab View: export only the active tab's visible data */
-            const csvContent = buildCSVString(isolatedTable.headers, isolatedTable.rows);
-            const originalName = dataSets[activeTab]?.fileName || 'exported_data.csv';
-            const exportName = makeExportFileName(originalName);
-            downloadFile(csvContent, exportName);
+
+            const csvContent = buildCSVStringFromRows(mergedRows);
+            downloadFile(csvContent, 'merged_exported.csv');
+            return;
         }
-    }, [dataSets, settings.mergeFiles, settings.firstRowIsHeader, getFileHeadersAndRows, getColumnType, columnFilters, applySortToRows, hasActiveFilters, isolatedTable, activeTab]);
+
+        /**
+         * Tab View:
+         * Export only the currently visible tab with current sort + filters applied.
+         */
+        const csvContent = buildCSVString(isolatedTable.headers, isolatedTable.rows);
+        const originalName = dataSets[activeTab]?.fileName || 'exported_data.csv';
+        const exportName = makeExportFileName(originalName);
+        downloadFile(csvContent, exportName);
+    }, [
+        dataSets,
+        settings.mergeFiles,
+        settings.firstRowIsHeader,
+        getFileHeadersAndRows,
+        getColumnType,
+        columnFilters,
+        applySortToRows,
+        isolatedTable,
+        activeTab,
+    ]);
 
     return (
         <>
