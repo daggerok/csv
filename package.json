@@ -14,7 +14,7 @@
     "restart": "pm2 restart app",
     "stop": "pm2 kill",
     "logs": "pm2 logs",
-    "test": "jest src",
+    "test": "npm run build",
     "dev": "npm run test -- --watchAll"
   },
   "keywords": [
