@@ -32,10 +32,10 @@
  * including persistence of custom column headers, types, merge, sticky toggles,
  * and column filters.
  *
- * 2. [Heuristic CSV Parser (`parseCSVRow` & `extractValidTableData`)]
+ * 2. [Heuristic CSV Parser (`parseCSVText` & `extractValidTableData`)]
  * - CSVs may contain unstructured preamble/postamble.
- * - The heuristic algorithm splits the file by lines, parses them properly
- * respecting double quotes, and counts columns.
+ * - The heuristic algorithm splits the file into rows in one quote-aware pass
+ * (quoted fields may contain commas, "" and newlines), and counts columns.
  * - It isolates the longest contiguous block of rows that share the same
  * (or majority) column length, effectively stripping out non-tabular text
  * and account summaries.
@@ -363,27 +363,40 @@ dbg('NEEDS_BOOT_RESTORE =', NEEDS_BOOT_RESTORE);
 // CSV PARSING
 // ============================================================================
 
-function parseCSVRow(row: string): string[] {
-    const result: string[] = [];
+/** RFC 4180 split of the whole text into rows: quoted fields may contain commas, "" and newlines. */
+function parseCSVText(text: string): string[][] {
+    const rows: string[][] = [];
+    let row: string[] = [];
+    let field = '';
     let inQuotes = false;
-    let currentValue = '';
-    for (let i = 0; i < row.length; i++) {
-        const char = row[i];
-        if (char === '"') {
-            if (inQuotes && row[i + 1] === '"') { currentValue += '"'; i++; }
-            else { inQuotes = !inQuotes; }
-        } else if (char === ',' && !inQuotes) {
-            result.push(currentValue.trim());
-            currentValue = '';
-        } else { currentValue += char; }
+    let sawAny = false;
+    for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        if (inQuotes) {
+            if (char === '"') {
+                if (text[i + 1] === '"') { field += '"'; i++; }
+                else inQuotes = false;
+            } else field += char;
+            continue;
+        }
+        if (char === '"') { inQuotes = true; sawAny = true; continue; }
+        if (char === ',') { row.push(field.trim()); field = ''; sawAny = true; continue; }
+        if (char === '\r') continue;
+        if (char === '\n') {
+            row.push(field.trim());
+            if (sawAny || row.length > 1) rows.push(row);
+            row = []; field = ''; sawAny = false;
+            continue;
+        }
+        field += char; sawAny = true;
     }
-    result.push(currentValue.trim());
-    return result;
+    row.push(field.trim());
+    if (sawAny || row.length > 1) rows.push(row);
+    return rows;
 }
 
 function extractValidTableData(rawText: string): string[][] {
-    const lines = rawText.split(/\r?\n/).filter(line => line.trim() !== '');
-    const parsedLines = lines.map(parseCSVRow);
+    const parsedLines = parseCSVText(rawText).filter(row => row.some(cell => cell !== ''));
     if (parsedLines.length === 0) return [];
     const colCounts: Record<number, number> = {};
     parsedLines.forEach(row => { if (row.length > 2) colCounts[row.length] = (colCounts[row.length] || 0) + 1; });
