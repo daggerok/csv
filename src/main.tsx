@@ -1675,7 +1675,7 @@ const App: React.FC = () => {
                         <div className="flex-1 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950" />
                     )}
                 </main>
-                <footer className="shrink-0 px-4 py-1 text-center text-[10px] leading-tight text-slate-400">
+                <footer className="shrink-0 px-4 pb-4 flex justify-center text-[10px] leading-none text-slate-400">
                     <a href={REPO_URL} target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-slate-600 dark:hover:text-slate-200">
                         daggerok &copy; {new Date().getFullYear()}
                     </a>
