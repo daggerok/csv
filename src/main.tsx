@@ -437,9 +437,9 @@ const TYPE_PATTERNS: { type: ColumnType; pattern: RegExp }[] = [
     { type: 'number', pattern: /^[+-]?[\d,]+\.?\d*$/ },
 ];
 
-function detectColumnType(rows: string[][], colIndex: number): ColumnType {
+function detectColumnTypeFrom(rows: string[][], colIndex: number, start: number): ColumnType {
     const samples: string[] = [];
-    for (let i = 0; i < rows.length && samples.length < TYPE_DETECTION_SAMPLE_SIZE; i++) {
+    for (let i = start; i < rows.length && samples.length < TYPE_DETECTION_SAMPLE_SIZE; i++) {
         const val = (rows[i][colIndex] || '').trim();
         if (val !== '' && val !== '--' && val !== 'N/A' && val !== 'n/a') samples.push(val);
     }
@@ -449,6 +449,13 @@ function detectColumnType(rows: string[][], colIndex: number): ColumnType {
         if (samples.filter(s => pattern.test(s)).length >= threshold) return type;
     }
     return 'string';
+}
+
+// With "1st Row = Header" off, row 0 is the header text and outvotes sparse columns
+// (one value plus "--" everywhere else), so retry without it before giving up
+function detectColumnType(rows: string[][], colIndex: number): ColumnType {
+    const type = detectColumnTypeFrom(rows, colIndex, 0);
+    return type === 'string' && rows.length > 1 ? detectColumnTypeFrom(rows, colIndex, 1) : type;
 }
 
 const SUFFIX_MULTIPLIERS: Record<string, number> = { 'K': 1e3, 'M': 1e6, 'B': 1e9, 'T': 1e12 };
@@ -977,7 +984,7 @@ const ColumnHeader: React.FC<{
                 </div>
                 <span className={`truncate flex-1 ${isMergeView ? '' : 'font-semibold'}`}>{header}</span>
                 <button onClick={e => { e.stopPropagation(); const i = ALL_COLUMN_TYPES.indexOf(colType); onTypeChange(colIndex, ALL_COLUMN_TYPES[(i + 1) % ALL_COLUMN_TYPES.length]); }}
-                        className={`shrink-0 px-1.5 py-0 rounded text-[9px] font-bold leading-4 tracking-wide transition-all cursor-pointer border border-transparent hover:border-slate-400 dark:hover:border-slate-500 ${isActiveSort ? 'opacity-100' : 'opacity-0 group-hover/header:opacity-70'} ${COLUMN_TYPE_COLORS[colType]}`}
+                        className={`shrink-0 px-1.5 py-0 rounded text-[9px] font-bold leading-4 tracking-wide transition-all cursor-pointer border border-transparent hover:border-slate-400 dark:hover:border-slate-500 ${isActiveSort ? 'opacity-100' : 'opacity-70 hover:opacity-100'} ${COLUMN_TYPE_COLORS[colType]}`}
                         title={`Column type: ${colType}. Click to cycle.`}>{COLUMN_TYPE_LABELS[colType]}</button>
                 <button onClick={onEditStart} className="opacity-0 group-hover/header:opacity-100 text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-all p-0.5 shrink-0" title="Rename Column">
                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
