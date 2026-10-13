@@ -195,7 +195,7 @@
  */
 
 // @ts-ignore
-import React, { useState, useEffect, useRef, useMemo, useCallback, ChangeEvent } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback, ChangeEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 
 // ============================================================================
@@ -249,12 +249,15 @@ const NUMERIC_FILTER_TYPES: Set<ColumnType> = new Set(['number', 'percent', 'cur
 interface AppSettings {
     theme: 'light' | 'dark';
     firstRowIsHeader: boolean;
-    firstColIsHeader: boolean;
     mergeFiles: boolean;
     stickyHeaders: boolean;
     rememberData: boolean; // Persist imported datasets to localStorage across reloads
     columnCustomNames: Record<number, string>;
     columnTypeOverrides: Record<number, ColumnType>;
+    /** Columns anchored by the user: they stay in place and stick to the left edge on horizontal scroll.
+     *  Merge view shares one set (its blocks share columns), tab view keeps one set per file name */
+    pinnedColumns: number[];
+    pinnedColumnsByFile: Record<string, number[]>;
     /** Persisted column filter expressions, keyed by column index */
     columnFilters: Record<number, string>;
     /** Persisted global sort state */
@@ -309,12 +312,13 @@ const LOCALSTORAGE_MAX_DATA_MB = 4;
 const DEFAULT_SETTINGS: AppSettings = {
     theme: 'light',
     firstRowIsHeader: false,
-    firstColIsHeader: true,
     mergeFiles: false,
     stickyHeaders: true,
     rememberData: true,
     columnCustomNames: {},
     columnTypeOverrides: {},
+    pinnedColumns: [],
+    pinnedColumnsByFile: {},
     columnFilters: {},
     sortState: { columnIndex: null, direction: 'asc' },
 };
@@ -323,7 +327,9 @@ const DEFAULT_LOADING_STATE: LoadingState = { active: false, phase: 'idle', curr
 const DEFAULT_SORT_STATE: SortState = { columnIndex: null, direction: 'asc' };
 const EXPENSIVE_TOGGLE_ROW_THRESHOLD = 500;
 const TYPE_DETECTION_SAMPLE_SIZE = 20;
-const LAYOUT_RESTRUCTURING_KEYS: Set<keyof AppSettings> = new Set(['mergeFiles', 'firstRowIsHeader', 'firstColIsHeader']);
+const LAYOUT_RESTRUCTURING_KEYS: Set<keyof AppSettings> = new Set(['mergeFiles', 'firstRowIsHeader']);
+/** Merge view renders every column at a fixed width (Tailwind w-[180px]), so pinned offsets are multiples of it */
+const MERGE_COLUMN_WIDTH = 180;
 const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
 /**
@@ -697,10 +703,14 @@ function makeExportFileName(originalName: string): string {
  */
 const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
+const columnIndexes = (v: unknown): number[] => (Array.isArray(v)
+    ? [...new Set(v.filter((x): x is number => Number.isInteger(x) && x >= 0))].sort((a, b) => a - b)
+    : []);
+
 /** Settings from localStorage or an imported file: every field is checked, a bad one falls back to the default. */
 function sanitizeSettings(raw: unknown): AppSettings {
     const s = isPlainObject(raw) ? raw : {};
-    const bool = (key: 'firstRowIsHeader' | 'firstColIsHeader' | 'mergeFiles' | 'stickyHeaders' | 'rememberData') =>
+    const bool = (key: 'firstRowIsHeader' | 'mergeFiles' | 'stickyHeaders' | 'rememberData') =>
         (typeof s[key] === 'boolean' ? s[key] : DEFAULT_SETTINGS[key]) as boolean;
     const strings = (v: unknown) => (isPlainObject(v)
         ? Object.fromEntries(Object.entries(v).filter(([k, x]) => /^\d+$/.test(k) && typeof x === 'string'))
@@ -712,12 +722,15 @@ function sanitizeSettings(raw: unknown): AppSettings {
     return {
         theme: s.theme === 'dark' ? 'dark' : 'light',
         firstRowIsHeader: bool('firstRowIsHeader'),
-        firstColIsHeader: bool('firstColIsHeader'),
         mergeFiles: bool('mergeFiles'),
         stickyHeaders: bool('stickyHeaders'),
         rememberData: bool('rememberData'),
         columnCustomNames: strings(s.columnCustomNames),
         columnTypeOverrides: types as Record<number, ColumnType>,
+        pinnedColumns: columnIndexes(s.pinnedColumns),
+        pinnedColumnsByFile: isPlainObject(s.pinnedColumnsByFile)
+            ? Object.fromEntries(Object.entries(s.pinnedColumnsByFile).map(([k, v]) => [k, columnIndexes(v)]).filter(([, v]) => v.length > 0))
+            : {},
         columnFilters: strings(s.columnFilters),
         sortState: {
             columnIndex: typeof sort.columnIndex === 'number' && Number.isInteger(sort.columnIndex) && sort.columnIndex >= 0 ? sort.columnIndex : null,
@@ -959,11 +972,13 @@ const ColumnHeader: React.FC<{
     onSort: (col: number, dir: 'asc' | 'desc') => void;
     onTypeChange: (col: number, t: ColumnType) => void;
     onFilterChange: (col: number, value: string) => void;
+    isPinned: boolean;
+    onTogglePin: (col: number) => void;
     isMergeView?: boolean;
 }> = ({
           header, colIndex, sortState, colType, isEditing, editValue, filterValue,
           onEditChange, onEditStart, onEditSave, onEditCancel,
-          onSort, onTypeChange, onFilterChange, isMergeView = false,
+          onSort, onTypeChange, onFilterChange, isPinned, onTogglePin, isMergeView = false,
       }) => {
     const isActiveSort = sortState.columnIndex === colIndex;
     const isAsc = isActiveSort && sortState.direction === 'asc';
@@ -982,6 +997,11 @@ const ColumnHeader: React.FC<{
                         <svg className="w-3 h-3" viewBox="0 0 12 12" fill="currentColor"><path d="M6 10L2 4H10L6 10Z" /></svg>
                     </button>
                 </div>
+                <button onClick={e => { e.stopPropagation(); onTogglePin(colIndex); }}
+                        className={`shrink-0 p-0.5 transition-all ${isPinned ? 'text-blue-600 dark:text-blue-400 opacity-100' : 'text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 opacity-40 group-hover/header:opacity-100'}`}
+                        title={isPinned ? 'Unpin column' : 'Pin column (stays visible on horizontal scroll)'}>
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M12 22V8" /><path d="M5 12H2a10 10 0 0 0 20 0h-3" /><circle cx="12" cy="5" r="3" /></svg>
+                </button>
                 <span className={`truncate flex-1 ${isMergeView ? '' : 'font-semibold'}`}>{header}</span>
                 <button onClick={e => { e.stopPropagation(); const i = ALL_COLUMN_TYPES.indexOf(colType); onTypeChange(colIndex, ALL_COLUMN_TYPES[(i + 1) % ALL_COLUMN_TYPES.length]); }}
                         className={`shrink-0 px-1.5 py-0 rounded text-[9px] font-bold leading-4 tracking-wide transition-all cursor-pointer border border-transparent hover:border-slate-400 dark:hover:border-slate-500 ${isActiveSort ? 'opacity-100' : 'opacity-70 hover:opacity-100'} ${COLUMN_TYPE_COLORS[colType]}`}
@@ -1402,6 +1422,23 @@ const App: React.FC = () => {
         setSortState(DEFAULT_SORT_STATE);
     }, []);
 
+    const activeFileName = dataSets[activeTab]?.fileName ?? '';
+    const pinnedColumns = useMemo(
+        () => (settings.mergeFiles ? settings.pinnedColumns : settings.pinnedColumnsByFile[activeFileName] ?? []),
+        [settings.mergeFiles, settings.pinnedColumns, settings.pinnedColumnsByFile, activeFileName],
+    );
+    const isPinned = useCallback((colIndex: number) => pinnedColumns.includes(colIndex), [pinnedColumns]);
+
+    const handleTogglePin = useCallback((colIndex: number) => {
+        const toggle = (cols: number[]) => (cols.includes(colIndex) ? cols.filter(c => c !== colIndex) : [...cols, colIndex].sort((a, b) => a - b));
+        setSettings(prev => {
+            if (prev.mergeFiles) return { ...prev, pinnedColumns: toggle(prev.pinnedColumns) };
+            const { [activeFileName]: current = [], ...others } = prev.pinnedColumnsByFile;
+            const next = toggle(current);
+            return { ...prev, pinnedColumnsByFile: next.length > 0 ? { ...others, [activeFileName]: next } : others };
+        });
+    }, [activeFileName]);
+
     const handleFilterChange = useCallback((colIndex: number, value: string) => {
         setColumnFilters(prev => {
             const next = { ...prev };
@@ -1449,6 +1486,32 @@ const App: React.FC = () => {
     }, [activeData, settings.firstRowIsHeader, getColumnType]);
 
     const hasActiveFilters = Object.keys(columnFilters).length > 0;
+
+    // Tab view uses an auto-width table, so a pinned column's sticky `left` is the measured
+    // width of the pinned columns before it; re-measured whenever one of them resizes
+    const tabHeaderRefs = useRef<(HTMLTableCellElement | null)[]>([]);
+    const [tabPinOffsets, setTabPinOffsets] = useState<Record<number, number>>({});
+    const tabPinnedColumns = useMemo(
+        () => isolatedTable.headers.map((_, i) => i).filter(isPinned),
+        [isolatedTable.headers, isPinned],
+    );
+    useLayoutEffect(() => {
+        if (settings.mergeFiles) return;
+        const measure = () => {
+            const next: Record<number, number> = {};
+            let left = 0;
+            for (const i of tabPinnedColumns) { next[i] = left; left += tabHeaderRefs.current[i]?.offsetWidth ?? 0; }
+            setTabPinOffsets(prev => JSON.stringify(prev) === JSON.stringify(next) ? prev : next);
+        };
+        measure();
+        const observer = new ResizeObserver(measure);
+        tabPinnedColumns.forEach(i => { const el = tabHeaderRefs.current[i]; if (el) observer.observe(el); });
+        return () => observer.disconnect();
+    }, [tabPinnedColumns, settings.mergeFiles]);
+
+    const mergePinOffset = useCallback((colIndex: number) =>
+        MERGE_COLUMN_WIDTH * pinnedColumns.filter(c => c < colIndex).length,
+    [pinnedColumns]);
 
     // -------------------------------------------------------------------------
     // EXPORT CSV — three modes:
@@ -1568,10 +1631,6 @@ const App: React.FC = () => {
                             <span className="font-medium">1st Row = Header</span>
                         </label>
                         <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
-                            <input type="checkbox" checked={settings.firstColIsHeader} onChange={e => updateSettingWithSpinner('firstColIsHeader', e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
-                            <span className="font-medium">1st Col = Sticky</span>
-                        </label>
-                        <label className="flex items-center gap-2 cursor-pointer bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
                             <input type="checkbox" checked={settings.rememberData} onChange={e => handleToggleRememberData(e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 bg-slate-100 border-slate-300" />
                             <span className={`font-semibold ${settings.rememberData ? 'text-orange-600 dark:text-orange-400' : 'text-slate-500'}`}>Remember Data</span>
                         </label>
@@ -1680,17 +1739,17 @@ const App: React.FC = () => {
                                             return (
                                                 <div key={fileIdx} className="relative border-b border-slate-200 dark:border-slate-800 last:border-none bg-white dark:bg-slate-950 flex flex-col w-full">
                                                     <div className={`${settings.stickyHeaders ? 'sticky top-0 z-30' : ''} bg-white dark:bg-slate-950 flex flex-col -mb-px`}>
-                                                        <div className="bg-blue-50 dark:bg-blue-950 border-b border-blue-200 dark:border-blue-900/50 select-none py-1.5 h-8 w-max min-w-full relative">
+                                                        <div className="bg-blue-50 dark:bg-blue-950 border-b border-blue-200 dark:border-blue-900/50 select-none py-1.5 h-8 w-max min-w-full flex items-center justify-between">
                                                             <span className="sticky left-0 px-4 text-xs font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950 z-10 py-1">
                                                                 FILE [{fileIdx + 1}/{dataSets.length}]: {dataset.fileName}
                                                                 {hasActiveFilters && <span className="ml-2 text-blue-500">({sorted.length}/{rows.length} rows)</span>}
                                                             </span>
-                                                            <span className="absolute right-4 text-[10px] uppercase opacity-50 tracking-wider font-semibold top-2 text-blue-700 dark:text-blue-400">Merged Block</span>
+                                                            <span className="sticky right-0 px-4 text-[10px] uppercase tracking-wider font-semibold text-blue-700/50 dark:text-blue-400/50 bg-blue-50 dark:bg-blue-950 z-10 py-1">Merged Block</span>
                                                         </div>
                                                         <div className="flex bg-slate-100 dark:bg-slate-800 border-b border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-sm font-semibold pt-[9px]">
                                                             {headers.map((header, i) => (
-                                                                <div key={i} className={`px-4 py-2 shrink-0 flex items-center justify-between gap-1 w-[180px] bg-slate-100 dark:bg-slate-800 ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 z-35 border-r border-slate-300 dark:border-slate-700 font-bold' : ''}`}>
-                                                                    <ColumnHeader header={header} colIndex={i} fileIndex={fileIdx} sortState={sortState} colType={getColType(i)} isEditing={editingHeaderKey === `${fileIdx}-${i}`} editValue={editHeaderValue} filterValue={columnFilters[i] || ''} onEditChange={setEditHeaderValue} onEditStart={() => startEditingHeader(fileIdx, i, header)} onEditSave={() => saveHeaderName(i)} onEditCancel={cancelEditingHeader} onSort={handleSort} onTypeChange={handleTypeChange} onFilterChange={handleFilterChange} isMergeView={true} />
+                                                                <div key={i} style={isPinned(i) ? { left: mergePinOffset(i) } : undefined} className={`px-4 py-2 shrink-0 flex items-center justify-between gap-1 w-[180px] bg-slate-100 dark:bg-slate-800 ${isPinned(i) ? 'sticky z-35 border-r border-slate-300 dark:border-slate-700 font-bold' : ''}`}>
+                                                                    <ColumnHeader header={header} colIndex={i} fileIndex={fileIdx} sortState={sortState} colType={getColType(i)} isEditing={editingHeaderKey === `${fileIdx}-${i}`} editValue={editHeaderValue} filterValue={columnFilters[i] || ''} onEditChange={setEditHeaderValue} onEditStart={() => startEditingHeader(fileIdx, i, header)} onEditSave={() => saveHeaderName(i)} onEditCancel={cancelEditingHeader} onSort={handleSort} onTypeChange={handleTypeChange} onFilterChange={handleFilterChange} isPinned={isPinned(i)} onTogglePin={handleTogglePin} isMergeView={true} />
                                                                 </div>
                                                             ))}
                                                         </div>
@@ -1699,7 +1758,7 @@ const App: React.FC = () => {
                                                         {sorted.map((row, ri) => (
                                                             <div key={ri} className="flex hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
                                                                 {headers.map((_, ci) => (
-                                                                    <div key={ci} className={`px-4 py-2 shrink-0 w-[180px] text-slate-800 dark:text-slate-300 truncate ${settings.firstColIsHeader && ci === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800 shadow-2xs' : ''}`}>{row[ci] || ''}</div>
+                                                                    <div key={ci} style={isPinned(ci) ? { left: mergePinOffset(ci) } : undefined} className={`px-4 py-2 shrink-0 w-[180px] text-slate-800 dark:text-slate-300 truncate ${isPinned(ci) ? 'sticky bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800 shadow-2xs' : ''}`}>{row[ci] || ''}</div>
                                                                 ))}
                                                             </div>
                                                         ))}
@@ -1714,8 +1773,8 @@ const App: React.FC = () => {
                                         <thead>
                                         <tr className="text-slate-700 dark:text-slate-300">
                                             {isolatedTable.headers.map((header, i) => (
-                                                <th key={i} className={`px-4 py-2 border-b border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 relative outline-1 outline-slate-100 dark:outline-slate-800 ${settings.stickyHeaders ? 'sticky top-0 z-20' : ''} ${settings.firstColIsHeader && i === 0 ? 'sticky left-0 border-r border-slate-300 dark:border-slate-700' : ''} ${settings.stickyHeaders && settings.firstColIsHeader && i === 0 ? 'z-30' : ''}`}>
-                                                    <ColumnHeader header={header} colIndex={i} fileIndex={activeTab} sortState={sortState} colType={activeColumnTypes[i] || 'string'} isEditing={editingHeaderKey === `${activeTab}-${i}`} editValue={editHeaderValue} filterValue={columnFilters[i] || ''} onEditChange={setEditHeaderValue} onEditStart={() => startEditingHeader(activeTab, i, header)} onEditSave={() => saveHeaderName(i)} onEditCancel={cancelEditingHeader} onSort={handleSort} onTypeChange={handleTypeChange} onFilterChange={handleFilterChange} />
+                                                <th key={i} ref={el => { tabHeaderRefs.current[i] = el; }} style={isPinned(i) ? { left: tabPinOffsets[i] ?? 0 } : undefined} className={`px-4 py-2 border-b border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 relative outline-1 outline-slate-100 dark:outline-slate-800 ${settings.stickyHeaders ? 'sticky top-0 z-20' : ''} ${isPinned(i) ? `sticky border-r border-slate-300 dark:border-slate-700 ${settings.stickyHeaders ? 'z-30' : 'z-10'}` : ''}`}>
+                                                    <ColumnHeader header={header} colIndex={i} fileIndex={activeTab} sortState={sortState} colType={activeColumnTypes[i] || 'string'} isEditing={editingHeaderKey === `${activeTab}-${i}`} editValue={editHeaderValue} filterValue={columnFilters[i] || ''} onEditChange={setEditHeaderValue} onEditStart={() => startEditingHeader(activeTab, i, header)} onEditSave={() => saveHeaderName(i)} onEditCancel={cancelEditingHeader} onSort={handleSort} onTypeChange={handleTypeChange} onFilterChange={handleFilterChange} isPinned={isPinned(i)} onTogglePin={handleTogglePin} />
                                                 </th>
                                             ))}
                                         </tr>
@@ -1724,7 +1783,7 @@ const App: React.FC = () => {
                                         {isolatedTable.rows.map((row, ri) => (
                                             <tr key={ri} className="hover:bg-slate-50/50 dark:hover:bg-slate-900/50 transition-colors">
                                                 {isolatedTable.headers.map((_, ci) => (
-                                                    <td key={ci} className={`px-4 py-2 text-slate-800 dark:text-slate-300 ${settings.firstColIsHeader && ci === 0 ? 'sticky left-0 bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800' : ''}`}>{row[ci] || ''}</td>
+                                                    <td key={ci} style={isPinned(ci) ? { left: tabPinOffsets[ci] ?? 0 } : undefined} className={`px-4 py-2 text-slate-800 dark:text-slate-300 ${isPinned(ci) ? 'sticky bg-white dark:bg-slate-950 font-medium z-10 border-r border-slate-200 dark:border-slate-800' : ''}`}>{row[ci] || ''}</td>
                                                 ))}
                                             </tr>
                                         ))}
