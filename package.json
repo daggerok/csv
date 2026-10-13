@@ -37,7 +37,7 @@
   "devDependencies": {
     "@parcel/transformer-sass": "2.16.4",
     "@types/node": "26.1.1",
-    "jest": "30.4.2",
+    "jest": "30.5.2",
     "parcel": "2.16.4",
     "pm2": "7.0.4",
     "rimraf": "6.1.3",
