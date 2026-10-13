@@ -1516,7 +1516,7 @@ const App: React.FC = () => {
                     </div>
                 </header>
 
-                <main className="flex-1 flex flex-col p-4 gap-4 max-w-full overflow-hidden min-h-0 bg-slate-50 dark:bg-slate-900 transition-colors duration-300">
+                <main className="flex-1 flex flex-col px-4 pt-4 gap-4 max-w-full overflow-hidden min-h-0 bg-slate-50 dark:bg-slate-900 transition-colors duration-300">
                     <input type="file" ref={fileInputRef} multiple accept=".csv" className="hidden" onChange={handleFileUpload} />
 
                     <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-slate-950 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm shrink-0">
@@ -1675,7 +1675,7 @@ const App: React.FC = () => {
                         <div className="flex-1 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950" />
                     )}
                 </main>
-                <footer className="shrink-0 px-4 pb-4 flex justify-center text-[10px] leading-none text-slate-400">
+                <footer className="flex h-4 shrink-0 items-center justify-center px-4 text-[10px] leading-none text-slate-400">
                     <a href={REPO_URL} target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-slate-600 dark:hover:text-slate-200">
                         daggerok &copy; {new Date().getFullYear()}
                     </a>
