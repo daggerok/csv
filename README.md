@@ -1,7 +1,6 @@
 # CSV Viewer [![CI](https://github.com/daggerok/csv/actions/workflows/ci.yaml/badge.svg)](https://github.com/daggerok/csv/actions/workflows/ci.yaml)
-A high-performance, single-file client-side React application designed to instantly parse, auto-clean, and visualize
-unstructured data tables extracted from raw Fidelity CSV exports. Built with **Bun**, **Vite**, **TypeScript**, and
-**TailwindCSS v4**.
+A single-file client-side React application that parses, auto-cleans and displays data tables from raw Fidelity CSV
+exports. Built with **Bun**, **Parcel**, **TypeScript** and **TailwindCSS v4**
 
 ---
 
@@ -10,33 +9,36 @@ unstructured data tables extracted from raw Fidelity CSV exports. Built with **B
 ### 1. Heuristic CSV Parsing Algorithm
 Brokerage firms and financial reports typically contain messy headers, account preambles, and legal footers that
 break standard SQL or naive CSV parsers. This application uses a custom heuristic processor:
-* **Token Isolation:** Parses lines respecting double quotes and escaped quotes (`""`).
-* **Density Metrics:** Analyzes column count distribution across all rows, filtering out metadata fields.
-* **Contiguous Block Extraction:** Detects and extracts the longest sequential block of data sharing identical column
-  boundaries, automatically discarding messy postambles and legal disclaimers.
+* **Token Isolation:** Parses fields respecting double quotes, escaped quotes (`""`) and newlines inside quotes
+* **Density Metrics:** Picks the most common column count across all rows, filtering out metadata lines
+* **Contiguous Block Extraction:** Keeps the block of rows that fit that width (Fidelity data rows carry one extra
+  trailing comma), discarding preambles, postambles and legal disclaimers
 
 ### 2. Tailored UI/UX Enhancements
-* **Natural Sort Order:** Loaded file datasets and tabs are natively sorted via `Intl.Collator` using a strict
-  numerical sequence (e.g., `file2.csv` appears before `file10.csv`).
-* **Global Interactive Dropzone:** Click anywhere inside the empty state placeholder or the master import button to
-  trigger native system file explorers seamlessly via shared React `useRef` tokens.
-* **Advanced Sticky Layouts:** High-performance CSS containment supporting simultaneous sticky table headers
-  (`sticky top-0`) and sticky identifier columns (`sticky left-0`) for cross-browser sheet viewing.
+* **Natural Sort Order:** Loaded files and tabs are sorted via `Intl.Collator` with numeric ordering (`file2.csv`
+  comes before `file10.csv`)
+* **Import:** Click the empty-state placeholder or the Import CSV Files button to open the file picker
+* **Column Types:** Each column is detected as text, number, percent, currency or market cap; the badge in the header
+  shows the type and cycles it on click. Sorting and numeric filters follow the type
+* **Sticky Layout:** Sticky table headers, plus pinned columns: the anchor button in a column header keeps that column
+  at the left edge on horizontal scroll. Pins are per file in tabs and shared in merge view
+* **Merge View and Export:** Show all files as stacked blocks, export the active tab, one merged CSV or every file
+  separately, with sort and filters applied
 
 ### 3. State Persistence & StrictMode Safety
 * Features **Synchronous Lazy State Initialization** from `localStorage` to avoid multi-effect race conditions and
-  theme flickering often triggered by double-rendering in `React.StrictMode` environments during development.
-* Full integration with TailwindCSS v4 dark mode strategy using explicit DOM root synchronization.
-* Dedicated utilities to **Export/Import app configurations** to standalone JSON templates.
+  theme flickering often triggered by double-rendering in `React.StrictMode` environments during development
+* Dark mode via the TailwindCSS v4 `dark` class kept in sync on the document root
+* **Export/Import app configuration** as a JSON file
 
 ---
 
 ## 🛠️ Tech Stack
 
 * **Runtime:** [Bun](https://bun.sh/)
-* **Build Tool:** [Vite](https://vite.dev/)
+* **Build Tool:** [Parcel](https://parceljs.org/)
 * **Frontend Library:** React (TypeScript)
-* **Styling Framework:** TailwindCSS v4 (Utility-first, fully embedded optimized SVGs)
+* **Styling Framework:** TailwindCSS v4, icons are inline SVGs
 
 ---
 
@@ -57,7 +59,7 @@ Ensure you have [Bun](https://bun.sh/) installed locally on your development mac
    bun install -E
    ```
 
-3. Launch the local Vite development server with Hot Module Replacement (HMR):
+3. Launch the local Parcel development server with Hot Module Replacement (HMR):
    ```bash
    bun run serve
    ```
@@ -82,19 +84,17 @@ architecture or local offline workspace.
 ## 🛡️ Data Privacy Notice
 
 This application executes entirely client-side inside your web browser. No financial data, statements, ledger indices,
-or CSV filenames are transmitted to external cloud systems, tracking networks, or third-party servers. Your investment
-data remains isolated and completely secure.
+or CSV filenames are transmitted to external cloud systems, tracking networks, or third-party servers. With
+**Remember Data** on (the default), imported files are kept in this browser's `localStorage` until you turn it off or
+click Clear Data
 
 ## ⚠️ Known Issues
 
-Still open from the architecture review of 2026-07-13 (re-checked 2026-10-13). Fixed since then and dropped from
-this list: over-wide rows are no longer cut (PR #19). Not an issue by decision: the app stays a single `src/main.tsx`
-file (see its header)
+Open problems, planned to be fixed later
 
 ### Large files block the browser
 Files are read whole, parsed on the main thread, kept in React state and rendered without virtualization in both
-tab and merge views. Big exports or many files at once freeze the tab. Fix: parse in a Web Worker and virtualize rows.
-Remembered datasets stay in `localStorage` (IndexedDB is out of scope)
+tab and merge views. Big exports or many files at once freeze the tab. Fix: parse in a Web Worker and virtualize rows
 
 ### Parser trims quoted values
 `parseCSVText` calls `field.trim()` on every field, quoted ones included, so `"  keep spaces  "` loses its spaces.
@@ -102,20 +102,18 @@ Fix: trim only unquoted fields and add parser fixtures (embedded quotes, whitesp
 missing columns, Fidelity preambles and footers)
 
 ### Financial data is remembered by default
-`rememberData` defaults to `true`, so imported datasets stay in `localStorage` on shared or managed machines, while
-the Data Privacy Notice below only talks about network isolation. Fix: default to `false`, word the toggle as
-"Store imported data in this browser", mention local retention in the notice
+`rememberData` defaults to `true`, so imported datasets stay in `localStorage` on shared or managed machines. Fix:
+default to `false`, word the toggle as "Store imported data in this browser"
 
 ### Column settings are shared by index across files
 Custom names, type overrides, filters and sort are keyed by column index only, so renaming or filtering column 0 in
-one file applies to column 0 of every file. Pinned columns are already per file in tab view. Fix: key the rest by
-file (or schema) plus column index and decide per setting whether it is global or per file
+one file applies to column 0 of every file. Fix: key them by file (or schema) plus column index, as pinned columns
+already are
 
-### README and dependencies drift from the code
-This README says Vite, the build is Parcel. `clsx`, `lucide-react`, `recharts`, `tailwind-merge`, `papaparse` and
-`@types/papaparse` are declared but never imported. `bun audit` reports 33 vulnerabilities, all in dev tooling
-(`pm2`, Parcel, Jest), the production graph is clean. Fix: describe the real stack, drop unused packages, drop or
-upgrade `pm2`
+### Unused and vulnerable dependencies
+`clsx`, `lucide-react`, `recharts`, `tailwind-merge`, `papaparse` and `@types/papaparse` are declared but never
+imported. `bun audit` reports 33 vulnerabilities, all in dev tooling (`pm2`, Parcel, Jest), the production graph is
+clean. Fix: drop unused packages, drop or upgrade `pm2`
 
 ### No tests
 `bun run test` only runs the build and CI only builds. Fix: unit tests for the parser, filter grammar, type
