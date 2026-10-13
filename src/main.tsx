@@ -696,7 +696,11 @@ function loadPersistedDataSets(): DataSet[] | null {
         const raw = localStorage.getItem(LOCALSTORAGE_DATA_KEY);
         if (!raw) return null;
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed as DataSet[];
+        // A damaged or foreign record (e.g. {"dataSets": "x"}) must not reach the table code: check the DataSet shape
+        const valid = Array.isArray(parsed) && parsed.length > 0 && parsed.every((d: any) =>
+            d && typeof d.fileName === 'string' && Array.isArray(d.data) && d.data.every((row: unknown) => Array.isArray(row)));
+        if (valid) return parsed as DataSet[];
+        if (parsed !== null) console.warn('[RememberData] Ignoring persisted datasets with an unexpected shape');
         return null;
     } catch (err) {
         console.warn('[RememberData] Failed to load persisted datasets:', err);
