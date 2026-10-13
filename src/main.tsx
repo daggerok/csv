@@ -17,7 +17,7 @@
  * ============================================================================
  *
  * PROJECT: CSV Viewer — Data Viewer & Cleaner
- * ENVIRONMENT: Bun, Vite, React, TypeScript, TailwindCSS v4
+ * ENVIRONMENT: Bun, Parcel, React, TypeScript, TailwindCSS v4
  *
  * MODULES & FEATURES:
  * 1. [Types & State Management]
@@ -379,10 +379,12 @@ function parseCSVText(text: string): string[][] {
             } else field += char;
             continue;
         }
-        if (char === '"') { inQuotes = true; sawAny = true; continue; }
+        // A quote opens a quoted field only as the first character of the field: a bare " inside a value
+        // (PIPE 12" STEEL) is text, otherwise the rest of the file is swallowed into one field
+        if (char === '"' && field.trim() === '') { inQuotes = true; sawAny = true; field = ''; continue; }
         if (char === ',') { row.push(field.trim()); field = ''; sawAny = true; continue; }
-        if (char === '\r') continue;
-        if (char === '\n') {
+        if (char === '\r' && text[i + 1] === '\n') continue;
+        if (char === '\n' || char === '\r') {
             row.push(field.trim());
             if (sawAny || row.length > 1) rows.push(row);
             row = []; field = ''; sawAny = false;
@@ -399,21 +401,29 @@ function extractValidTableData(rawText: string): string[][] {
     const parsedLines = parseCSVText(rawText).filter(row => row.some(cell => cell !== ''));
     if (parsedLines.length === 0) return [];
     const colCounts: Record<number, number> = {};
-    parsedLines.forEach(row => { if (row.length > 2) colCounts[row.length] = (colCounts[row.length] || 0) + 1; });
+    parsedLines.forEach(row => { if (row.length >= 2) colCounts[row.length] = (colCounts[row.length] || 0) + 1; });
     let targetColLength = 0, maxOccurrences = 0;
     for (const [lengthStr, count] of Object.entries(colCounts)) {
         if (count > maxOccurrences) { maxOccurrences = count; targetColLength = parseInt(lengthStr, 10); }
     }
     if (targetColLength === 0) targetColLength = Math.max(...parsedLines.map(r => r.length));
+    // Rows one field shorter belong to the table too: Fidelity data rows end with a comma, so the
+    // header has one field less than every data row and used to be dropped. Rows are padded, never cut
     const tableData: string[][] = [];
     let isRecording = false;
     for (const row of parsedLines) {
-        if (row.length === targetColLength || row.length === targetColLength + 1) {
+        // one wider row inside the table is kept (an unquoted comma), but a wider preamble line never starts it
+        const fits = row.length >= Math.max(2, targetColLength - 1) && row.length <= targetColLength + (isRecording ? 1 : 0);
+        if (fits) {
             isRecording = true;
-            tableData.push(row.slice(0, targetColLength));
+            tableData.push(row);
         } else if (isRecording && row.length < targetColLength - 1) { break; }
     }
-    return tableData.length > 0 ? tableData : parsedLines;
+    if (tableData.length === 0) return parsedLines;
+    let width = Math.max(...tableData.map(r => r.length));
+    // a trailing column that is empty in every row (the trailing comma) is not a column
+    while (width > 1 && tableData.every(r => (r[width - 1] ?? '') === '')) width--;
+    return tableData.map(r => (r.length >= width ? r.slice(0, width) : [...r, ...Array.from({ length: width - r.length }, () => '')]));
 }
 
 // ============================================================================
@@ -422,8 +432,8 @@ function extractValidTableData(rawText: string): string[][] {
 
 const TYPE_PATTERNS: { type: ColumnType; pattern: RegExp }[] = [
     { type: 'marketcap', pattern: /\$[\d,.]+\s*[KMBT]/i },
-    { type: 'percent', pattern: /^-?[\d,.]+\s*%$/ },
-    { type: 'currency', pattern: /^[($-]*\$[\d,.]+\)?$/ },
+    { type: 'percent', pattern: /^[+-]?[\d,.]+\s*%$/ },
+    { type: 'currency', pattern: /^[+(-]*\$-?[\d,.]+\)?$/ },
     { type: 'number', pattern: /^[+-]?[\d,]+\.?\d*$/ },
 ];
 
@@ -451,8 +461,8 @@ function extractSortValue(cellValue: string, colType: ColumnType): number | stri
         case 'percent': { const n = parseFloat(trimmed.replace(/%/g, '').replace(/,/g, '')); return isNaN(n) ? null : n; }
         case 'currency': {
             let c = trimmed.replace(/[$,\s]/g, '');
-            const neg = /^\(.*\)$/.test(trimmed) || trimmed.startsWith('-');
-            c = c.replace(/[()]/g, '').replace(/^-/, '');
+            const neg = /^\(.*\)$/.test(trimmed) || trimmed.includes('-');
+            c = c.replace(/[()+-]/g, '');
             const n = parseFloat(c); if (isNaN(n)) return null;
             return neg ? -n : n;
         }
@@ -490,7 +500,12 @@ function getComparator(colIndex: number, direction: 'asc' | 'desc', colType: Col
 // FILTER ENGINE
 // ============================================================================
 
-function tokenizeFilterInput(input: string): string[] {
+/**
+ * In numeric mode a comma between a digit and exactly three digits is a thousands separator (>1,000),
+ * not OR; write "10, 100" (with a space) for 10 OR 100.
+ */
+function tokenizeFilterInput(input: string, numeric: boolean = false): string[] {
+    if (numeric) input = input.replace(/(\d),(?=\d{3}(?!\d))/g, '$1');
     const tokens: string[] = [];
     let i = 0;
     const len = input.length;
@@ -519,7 +534,7 @@ function parseStringToken(token: string): StringFilterCondition {
     return { type: 'string', value: (negated ? token.slice(1) : token).toLowerCase(), negated };
 }
 
-const NUMERIC_TOKEN_REGEX = /^(!?)(>=|<=|!=|>|<|=)?(-?[\d,.]+)$/;
+const NUMERIC_TOKEN_REGEX = /^(!?)(>=|<=|!=|>|<|=)?\$?(-?[\d,.]+)%?$/;
 
 function parseNumericToken(token: string): NumericFilterCondition | null {
     const match = token.match(NUMERIC_TOKEN_REGEX);
@@ -540,15 +555,16 @@ function parseNumericToken(token: string): NumericFilterCondition | null {
 function parseFilterExpression(input: string, colType: ColumnType): FilterExpression | null {
     const trimmed = input.trim();
     if (trimmed === '') return null;
-    const tokens = tokenizeFilterInput(trimmed);
-    if (tokens.length === 0) return null;
     const isNumericMode = NUMERIC_FILTER_TYPES.has(colType);
+    const tokens = tokenizeFilterInput(trimmed, isNumericMode);
+    if (tokens.length === 0) return null;
     const orGroups: FilterCondition[][] = [];
     let currentGroup: FilterCondition[] = [];
     for (const token of tokens) {
         if (token === ',') { if (currentGroup.length > 0) { orGroups.push(currentGroup); currentGroup = []; } continue; }
-        if (isNumericMode) { const nc = parseNumericToken(token); if (nc) currentGroup.push(nc); else currentGroup.push(parseStringToken(token)); }
-        else { currentGroup.push(parseStringToken(token)); }
+        const condition: FilterCondition = (isNumericMode && parseNumericToken(token)) || parseStringToken(token);
+        if (condition.type === 'string' && condition.value === '') continue;
+        currentGroup.push(condition);
     }
     if (currentGroup.length > 0) orGroups.push(currentGroup);
     return orGroups.length > 0 ? { orGroups } : null;
@@ -581,8 +597,10 @@ function applyFilters(rows: string[][], filters: Record<number, string>, getColT
         const ci = parseInt(s, 10); const ct = getColType(ci); const ex = parseFilterExpression(f, ct);
         if (ex) parsed.push({ colIndex: ci, expression: ex, colType: ct });
     }
-    if (parsed.length === 0) return rows;
-    return rows.filter(row => parsed.every(({ colIndex, expression, colType }) => matchesFilter(row[colIndex] || '', expression, colType)));
+    const width = rows.reduce((max, row) => Math.max(max, row.length), 0);
+    const usable = parsed.filter(({ colIndex }) => colIndex < width);
+    if (usable.length === 0) return rows;
+    return rows.filter(row => usable.every(({ colIndex, expression, colType }) => matchesFilter(row[colIndex] || '', expression, colType)));
 }
 
 // ============================================================================
@@ -642,8 +660,10 @@ function downloadFile(content: string, fileName: string, mimeType: string = 'tex
     const a = document.createElement('a');
     a.href = url;
     a.download = fileName;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /**
@@ -668,6 +688,37 @@ function makeExportFileName(originalName: string): string {
  * Attempts to save datasets to localStorage.
  * Returns true if successful, false if data exceeds size limit or write fails.
  */
+const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** Settings from localStorage or an imported file: every field is checked, a bad one falls back to the default. */
+function sanitizeSettings(raw: unknown): AppSettings {
+    const s = isPlainObject(raw) ? raw : {};
+    const bool = (key: 'firstRowIsHeader' | 'firstColIsHeader' | 'mergeFiles' | 'stickyHeaders' | 'rememberData') =>
+        (typeof s[key] === 'boolean' ? s[key] : DEFAULT_SETTINGS[key]) as boolean;
+    const strings = (v: unknown) => (isPlainObject(v)
+        ? Object.fromEntries(Object.entries(v).filter(([k, x]) => /^\d+$/.test(k) && typeof x === 'string'))
+        : {}) as Record<number, string>;
+    const types = isPlainObject(s.columnTypeOverrides)
+        ? Object.fromEntries(Object.entries(s.columnTypeOverrides).filter(([k, x]) => /^\d+$/.test(k) && ALL_COLUMN_TYPES.includes(x as ColumnType)))
+        : {};
+    const sort = isPlainObject(s.sortState) ? s.sortState : {};
+    return {
+        theme: s.theme === 'dark' ? 'dark' : 'light',
+        firstRowIsHeader: bool('firstRowIsHeader'),
+        firstColIsHeader: bool('firstColIsHeader'),
+        mergeFiles: bool('mergeFiles'),
+        stickyHeaders: bool('stickyHeaders'),
+        rememberData: bool('rememberData'),
+        columnCustomNames: strings(s.columnCustomNames),
+        columnTypeOverrides: types as Record<number, ColumnType>,
+        columnFilters: strings(s.columnFilters),
+        sortState: {
+            columnIndex: typeof sort.columnIndex === 'number' && Number.isInteger(sort.columnIndex) && sort.columnIndex >= 0 ? sort.columnIndex : null,
+            direction: sort.direction === 'desc' ? 'desc' : 'asc',
+        },
+    };
+}
+
 function persistDataSets(dataSets: DataSet[]): boolean {
     try {
         const json = JSON.stringify(dataSets);
@@ -677,12 +728,14 @@ function persistDataSets(dataSets: DataSet[]): boolean {
                 `[RememberData] Dataset size (${sizeMB.toFixed(2)}MB) exceeds limit (${LOCALSTORAGE_MAX_DATA_MB}MB). ` +
                 `Data will NOT be persisted. Consider clearing old data or disabling Remember Data.`
             );
+            clearPersistedDataSets();
             return false;
         }
         localStorage.setItem(LOCALSTORAGE_DATA_KEY, json);
         return true;
     } catch (err) {
         console.warn('[RememberData] Failed to persist datasets to localStorage:', err);
+        clearPersistedDataSets();
         return false;
     }
 }
@@ -959,13 +1012,7 @@ const App: React.FC = () => {
             const saved = localStorage.getItem(LOCALSTORAGE_SETTINGS_KEY);
             if (saved) {
                 try {
-                    const parsed = JSON.parse(saved);
-                    return {
-                        ...DEFAULT_SETTINGS,
-                        ...parsed,
-                        columnFilters: parsed.columnFilters || {},
-                        sortState: { ...DEFAULT_SORT_STATE, ...(parsed.sortState || {}) },
-                    };
+                    return sanitizeSettings(JSON.parse(saved));
                 } catch {
                     /* ignore */
                 }
@@ -981,6 +1028,8 @@ const App: React.FC = () => {
     const [dataSets, setDataSets] = useState<DataSet[]>([]);
 
     const [activeTab, setActiveTab] = useState<number>(0);
+    const activeTabRef = useRef(0);
+    activeTabRef.current = activeTab;
 
     /**
      * Loading state initializer:
@@ -1162,7 +1211,9 @@ const App: React.FC = () => {
         if (settings.rememberData) {
             if (dataSets.length > 0) {
                 dbg('PersistEffect — persisting', dataSets.length, 'datasets');
-                persistDataSets(dataSets);
+                if (!persistDataSets(dataSets)) {
+                    alert(`The data is too large to remember (limit: ${LOCALSTORAGE_MAX_DATA_MB}MB): it will not come back after a reload.`);
+                }
             } else {
                 dbg('PersistEffect — clearing persisted data (empty datasets)');
                 clearPersistedDataSets();
@@ -1231,7 +1282,8 @@ const App: React.FC = () => {
         setSettings(DEFAULT_SETTINGS);
         setSortState(DEFAULT_SORT_STATE);
         setColumnFilters({});
-        clearPersistedDataSets();
+        if (DEFAULT_SETTINGS.rememberData && dataSets.length > 0) persistDataSets(dataSets);
+        else clearPersistedDataSets();
     }, [dataSets]);
 
     const handleExportSettings = () => {
@@ -1254,12 +1306,7 @@ const App: React.FC = () => {
                         await yieldToMain();
                     }
 
-                    const newSettings: AppSettings = {
-                        ...DEFAULT_SETTINGS,
-                        ...imported,
-                        columnFilters: imported.columnFilters || {},
-                        sortState: { ...DEFAULT_SORT_STATE, ...(imported.sortState || {}) },
-                    };
+                    const newSettings: AppSettings = sanitizeSettings(imported);
 
                     rememberDataRef.current = newSettings.rememberData;
                     setSettings(newSettings);
@@ -1295,7 +1342,13 @@ const App: React.FC = () => {
         }
         setLoadingState(prev => ({ ...prev, phase: 'rendering', fileName: '' }));
         await yieldToMain();
-        setDataSets(prev => [...prev, ...newResults].sort((a, b) => naturalCollator.compare(a.fileName, b.fileName)));
+        setDataSets(prev => {
+            const next = [...prev, ...newResults].sort((a, b) => naturalCollator.compare(a.fileName, b.fileName));
+            const open = prev[activeTabRef.current]?.fileName;
+            const keep = open === undefined ? -1 : next.findIndex(d => d.fileName === open);
+            if (keep >= 0) setActiveTab(keep);
+            return next;
+        });
     }, []);
 
     const handleFileUpload = useCallback((e: ChangeEvent<HTMLInputElement>) => {
@@ -1321,8 +1374,12 @@ const App: React.FC = () => {
         setEditHeaderValue(currentValue);
     };
     const saveHeaderName = (colIndex: number) => {
-        if (editHeaderValue.trim() !== '')
-            setSettings(prev => ({ ...prev, columnCustomNames: { ...prev.columnCustomNames, [colIndex]: editHeaderValue.trim() } }));
+        const name = editHeaderValue.trim();
+        setSettings(prev => {
+            const columnCustomNames = { ...prev.columnCustomNames };
+            if (name) columnCustomNames[colIndex] = name; else delete columnCustomNames[colIndex];
+            return { ...prev, columnCustomNames };
+        });
         setEditingHeaderKey(null);
     };
     const cancelEditingHeader = () => { setEditingHeaderKey(null); setEditHeaderValue(''); };
@@ -1460,7 +1517,7 @@ const App: React.FC = () => {
     const handleExportAllCSVFiles = useCallback(() => {
         if (dataSets.length === 0) return;
 
-        for (const dataset of dataSets) {
+        dataSets.forEach((dataset, index) => {
             const { headers, rows } = getFileHeadersAndRows(dataset.data);
             const dataRows = settings.firstRowIsHeader ? dataset.data.slice(1) : dataset.data;
             const getColType = (i: number) => getColumnType(i, dataRows);
@@ -1469,8 +1526,9 @@ const App: React.FC = () => {
 
             const csvContent = buildCSVString(headers, sorted);
             const exportName = makeExportFileName(dataset.fileName);
-            downloadFile(csvContent, exportName);
-        }
+            // browsers drop downloads started in the same tick: space them out
+            setTimeout(() => downloadFile(csvContent, exportName), index * 300);
+        });
     }, [
         dataSets,
         settings.firstRowIsHeader,
