@@ -88,18 +88,13 @@ data remains isolated and completely secure.
 ## ⚠️ Known Issues
 
 Still open from the architecture review of 2026-07-13 (re-checked 2026-10-13). Fixed since then and dropped from
-this list: over-wide rows are no longer cut (PR #19)
-
-### Monolithic `src/main.tsx`
-Parser, type detection, filter engine, export, persistence, loading orchestration and every UI component live in one
-1800+ line file, so domain logic cannot be tested on its own and every change touches the render file. Fix: move
-the domain code to `csv-parser.ts`, `column-types.ts`, `filters.ts`, `export.ts`, `settings-storage.ts` and the
-components to their own files, keeping the UX unchanged
+this list: over-wide rows are no longer cut (PR #19). Not an issue by decision: the app stays a single `src/main.tsx`
+file (see its header)
 
 ### Large files block the browser
 Files are read whole, parsed on the main thread, kept in React state and rendered without virtualization in both
-tab and merge views. Big exports or many files at once freeze the tab. Fix: parse in a Web Worker, virtualize rows,
-keep remembered datasets in IndexedDB instead of `localStorage`
+tab and merge views. Big exports or many files at once freeze the tab. Fix: parse in a Web Worker and virtualize rows.
+Remembered datasets stay in `localStorage` (IndexedDB is out of scope)
 
 ### Parser trims quoted values
 `parseCSVText` calls `field.trim()` on every field, quoted ones included, so `"  keep spaces  "` loses its spaces.
