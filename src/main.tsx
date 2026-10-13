@@ -945,6 +945,8 @@ const ColumnHeader: React.FC<{
 // MAIN APPLICATION COMPONENT
 // ============================================================================
 
+const REPO_URL = 'https://github.com/daggerok/csv';
+
 const App: React.FC = () => {
     dbg('App component rendering');
 
@@ -1673,6 +1675,11 @@ const App: React.FC = () => {
                         <div className="flex-1 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950" />
                     )}
                 </main>
+                <footer className="shrink-0 px-4 py-1 text-center text-[10px] leading-tight text-slate-400">
+                    <a href={REPO_URL} target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-slate-600 dark:hover:text-slate-200">
+                        daggerok &copy; {new Date().getFullYear()}
+                    </a>
+                </footer>
             </div>
         </>
     );
