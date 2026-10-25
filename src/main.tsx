@@ -1043,13 +1043,12 @@ const App: React.FC = () => {
     // -------------------------------------------------------------------------
     const [settings, setSettings] = useState<AppSettings>(() => {
         if (typeof window !== 'undefined') {
-            const saved = localStorage.getItem(LOCALSTORAGE_SETTINGS_KEY);
-            if (saved) {
-                try {
-                    return sanitizeSettings(JSON.parse(saved));
-                } catch {
-                    /* ignore */
-                }
+            // getItem itself throws when storage is blocked (privacy settings, sandboxed frame)
+            try {
+                const saved = localStorage.getItem(LOCALSTORAGE_SETTINGS_KEY);
+                if (saved) return sanitizeSettings(JSON.parse(saved));
+            } catch {
+                /* ignore */
             }
         }
         return DEFAULT_SETTINGS;
@@ -1216,7 +1215,10 @@ const App: React.FC = () => {
 
     // --- Theme & settings cache sync ---
     useEffect(() => {
-        localStorage.setItem(LOCALSTORAGE_SETTINGS_KEY, JSON.stringify(settings));
+        // Blocked storage or a full quota must not stop the theme from applying
+        try { localStorage.setItem(LOCALSTORAGE_SETTINGS_KEY, JSON.stringify(settings)); } catch (err) {
+            console.warn('[Settings] Failed to persist settings to localStorage:', err);
+        }
         if (settings.theme === 'dark') document.documentElement.classList.add('dark');
         else document.documentElement.classList.remove('dark');
     }, [settings]);
