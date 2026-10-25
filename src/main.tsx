@@ -403,6 +403,13 @@ function parseCSVText(text: string): string[][] {
     return rows;
 }
 
+/** Longest row length. A loop, not Math.max(...rows): spreading ~150k+ arguments overflows the V8 stack. */
+function maxRowLength(rows: readonly (readonly unknown[])[], min = 0): number {
+    let max = min;
+    for (const row of rows) if (row.length > max) max = row.length;
+    return max;
+}
+
 function extractValidTableData(rawText: string): string[][] {
     const parsedLines = parseCSVText(rawText).filter(row => row.some(cell => cell !== ''));
     if (parsedLines.length === 0) return [];
@@ -412,7 +419,7 @@ function extractValidTableData(rawText: string): string[][] {
     for (const [lengthStr, count] of Object.entries(colCounts)) {
         if (count > maxOccurrences) { maxOccurrences = count; targetColLength = parseInt(lengthStr, 10); }
     }
-    if (targetColLength === 0) targetColLength = Math.max(...parsedLines.map(r => r.length));
+    if (targetColLength === 0) targetColLength = maxRowLength(parsedLines);
     // Rows one field shorter belong to the table too: Fidelity data rows end with a comma, so the
     // header has one field less than every data row and used to be dropped. Rows are padded, never cut
     const tableData: string[][] = [];
@@ -426,7 +433,7 @@ function extractValidTableData(rawText: string): string[][] {
         } else if (isRecording && row.length < targetColLength - 1) { break; }
     }
     if (tableData.length === 0) return parsedLines;
-    let width = Math.max(...tableData.map(r => r.length));
+    let width = maxRowLength(tableData);
     // a trailing column that is empty in every row (the trailing comma) is not a column
     while (width > 1 && tableData.every(r => (r[width - 1] ?? '') === '')) width--;
     return tableData.map(r => (r.length >= width ? r.slice(0, width) : [...r, ...Array.from({ length: width - r.length }, () => '')]));
@@ -610,7 +617,7 @@ function applyFilters(rows: string[][], filters: Record<number, string>, getColT
         const ci = parseInt(s, 10); const ct = getColType(ci); const ex = parseFilterExpression(f, ct);
         if (ex) parsed.push({ colIndex: ci, expression: ex, colType: ct });
     }
-    const width = rows.reduce((max, row) => Math.max(max, row.length), 0);
+    const width = maxRowLength(rows);
     const usable = parsed.filter(({ colIndex }) => colIndex < width);
     if (usable.length === 0) return rows;
     return rows.filter(row => usable.every(({ colIndex, expression, colType }) => matchesFilter(row[colIndex] || '', expression, colType)));
@@ -1552,14 +1559,7 @@ const App: React.FC = () => {
             return { fileName: dataset.fileName, headers, rows: sorted };
         });
 
-        const maxCols = Math.max(
-            1,
-            ...blocks.map(block => Math.max(
-                block.headers.length,
-                ...block.rows.map(r => r.length),
-                1
-            ))
-        );
+        const maxCols = blocks.reduce((max, block) => Math.max(max, block.headers.length, maxRowLength(block.rows)), 1);
 
         const mergedRows: string[][] = [];
         for (const block of blocks) {
